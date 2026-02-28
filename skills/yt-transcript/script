@@ -1,0 +1,1424 @@
+#!/usr/bin/env python3
+"""
+YouTube transcript formatter.
+
+This script extracts transcript content from YouTube and writes a markdown artifact
+matching the work-vault transcript style.
+"""
+
+import argparse
+import datetime
+import glob
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from urllib.parse import parse_qs, urlparse
+
+YTDLP_IMPORT_ERROR = None
+
+try:
+    import yt_dlp
+    from yt_dlp.utils import DownloadError
+except ModuleNotFoundError as exc:  # handled in check_yt_dlp()
+    yt_dlp = None
+    DownloadError = Exception
+    YTDLP_IMPORT_ERROR = exc
+
+
+PYTHON_RECOMMENDED = (3, 10)
+EXCLUDED_SUBTITLE_PREFIXES = ('live_chat', 'chat', 'comments', 'description')
+YOUTUBE_SUBTITLE_PLAYER_CLIENTS = ('android', 'ios', 'web')
+BROWSER_SPEC_RE = re.compile(r'''(?x)
+    (?P<name>[^+:]+)
+    (?:\s*\+\s*(?P<keyring>[^:]+))?
+    (?:\s*:\s*(?!:)(?P<profile>.+?))?
+    (?:\s*::\s*(?P<container>.+))?
+''')
+
+
+class TranscriptExtractionError(RuntimeError):
+    """Raised when transcript providers cannot produce transcript entries."""
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Download and format YouTube transcripts with metadata'
+    )
+    parser.add_argument('url', help='YouTube video URL')
+    parser.add_argument(
+        'output_target',
+        help='Output directory (recommended) or explicit output .md file path'
+    )
+    parser.add_argument(
+        '--no-chapters',
+        action='store_true',
+        help='Skip chapter organization even if chapters exist'
+    )
+    parser.add_argument(
+        '--lang',
+        default='en',
+        help='Preferred subtitle language code (default: en)'
+    )
+    parser.add_argument(
+        '--proxy',
+        dest='proxy',
+        default=None,
+        help='Global HTTP/HTTPS/SOCKS proxy URL for yt-dlp requests'
+    )
+    parser.add_argument(
+        '--http-proxy',
+        dest='http_proxy',
+        default=None,
+        help='HTTP proxy URL (used by transcript API fallback; yt-dlp uses a single effective proxy)'
+    )
+    parser.add_argument(
+        '--https-proxy',
+        dest='https_proxy',
+        default=None,
+        help='HTTPS proxy URL (used by transcript API fallback; yt-dlp uses a single effective proxy)'
+    )
+    parser.add_argument(
+        '--cookies',
+        dest='cookies_file',
+        default=None,
+        help='Netscape-format cookie file path for yt-dlp'
+    )
+    parser.add_argument(
+        '--cookies-from-browser',
+        dest='cookies_from_browser',
+        default=None,
+        help='Browser spec: BROWSER[+KEYRING][:PROFILE][::CONTAINER] for yt-dlp'
+    )
+    parser.add_argument(
+        '--yt-impersonate',
+        dest='yt_impersonate',
+        default=None,
+        help='yt-dlp impersonation target, e.g. chrome or chrome:windows-10'
+    )
+    parser.add_argument(
+        '--asr-fallback',
+        action='store_true',
+        help='Use Whisper ASR fallback if subtitle providers fail (requires openai-whisper + ffmpeg)'
+    )
+    parser.add_argument(
+        '--asr-model',
+        default='small',
+        help='Whisper model to use with --asr-fallback (default: small)'
+    )
+    parser.add_argument(
+        '--no-artifact-on-failure',
+        action='store_true',
+        help='Do not write a markdown artifact when transcript extraction fails'
+    )
+    return parser.parse_args()
+
+
+def warn(message):
+    """Emit warning text to stderr."""
+    print(f'Warning: {message}', file=sys.stderr)
+
+
+def redact_sensitive_text(text):
+    """Redact credentials embedded in proxy URLs."""
+    if not text:
+        return text
+
+    return re.sub(
+        r'((?:https?|socks4a?|socks5h?)://)([^/@\s:]+)(?::([^@/\s]*))?@',
+        r'\1***:***@',
+        text,
+    )
+
+
+def parse_cookies_from_browser_spec(spec):
+    """Parse yt-dlp browser-cookie spec into expected tuple format."""
+    from yt_dlp.cookies import SUPPORTED_BROWSERS, SUPPORTED_KEYRINGS
+
+    mobj = BROWSER_SPEC_RE.fullmatch(spec or '')
+    if mobj is None:
+        raise RuntimeError(f'Invalid --cookies-from-browser format: {spec}')
+
+    browser_name, keyring, profile, container = mobj.group('name', 'keyring', 'profile', 'container')
+    browser_name = (browser_name or '').lower()
+    if browser_name not in SUPPORTED_BROWSERS:
+        supported = ', '.join(sorted(SUPPORTED_BROWSERS))
+        raise RuntimeError(f'Unsupported browser "{browser_name}". Supported: {supported}')
+
+    if keyring is not None:
+        keyring = keyring.upper()
+        if keyring not in SUPPORTED_KEYRINGS:
+            supported = ', '.join(sorted(SUPPORTED_KEYRINGS))
+            raise RuntimeError(f'Unsupported keyring "{keyring}". Supported: {supported}')
+
+    return (browser_name, profile, keyring, container)
+
+
+def validate_runtime_args(args):
+    """Validate and normalize runtime arguments."""
+    if args.cookies_file and args.cookies_from_browser:
+        raise RuntimeError('Use either --cookies or --cookies-from-browser, not both.')
+
+    if args.cookies_file:
+        cookie_path = os.path.abspath(os.path.expanduser(args.cookies_file))
+        if not os.path.isfile(cookie_path):
+            raise RuntimeError(f'Cookie file not found: {cookie_path}')
+        if not os.access(cookie_path, os.R_OK):
+            raise RuntimeError(f'Cookie file is not readable: {cookie_path}')
+        args.cookies_file = cookie_path
+
+    if args.cookies_from_browser:
+        args.cookies_from_browser = parse_cookies_from_browser_spec(args.cookies_from_browser)
+
+
+def effective_ytdlp_proxy(args):
+    """Resolve single proxy URL used by yt-dlp."""
+    if args.https_proxy is not None and args.http_proxy is not None and args.https_proxy != args.http_proxy:
+        warn('yt-dlp uses a single proxy URL; preferring --https-proxy over --http-proxy for yt-dlp calls.')
+
+    for value in (args.https_proxy, args.http_proxy, args.proxy):
+        if value is not None:
+            return value
+
+    return None
+
+
+def build_ytdlp_network_settings(args):
+    """Build yt-dlp network/auth option mapping."""
+    settings = {}
+
+    proxy = effective_ytdlp_proxy(args)
+    if proxy is not None:
+        settings['proxy'] = proxy
+
+    if args.cookies_file:
+        settings['cookiefile'] = args.cookies_file
+
+    if args.cookies_from_browser:
+        settings['cookiesfrombrowser'] = args.cookies_from_browser
+
+    if args.yt_impersonate is not None:
+        settings['impersonate'] = args.yt_impersonate
+
+    return settings
+
+
+def build_transcript_api_proxy_settings(args):
+    """Build proxy settings for youtube-transcript-api fallback."""
+    http_url = args.http_proxy if args.http_proxy is not None else args.proxy
+    https_url = args.https_proxy if args.https_proxy is not None else (args.proxy if args.proxy is not None else http_url)
+
+    http_url = (http_url or '').strip() or None
+    https_url = (https_url or '').strip() or None
+
+    if not http_url and not https_url:
+        return None
+
+    return {
+        'http_url': http_url,
+        'https_url': https_url,
+    }
+
+
+def validate_youtube_url(url):
+    """Validate that the URL is a YouTube URL."""
+    youtube_patterns = [
+        r'(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)',
+        r'(https?://)?(www\.)?youtube\.com/embed/',
+    ]
+
+    for pattern in youtube_patterns:
+        if re.search(pattern, url, re.IGNORECASE):
+            return True
+
+    return False
+
+
+def pip_install_hint(package_spec='yt-dlp'):
+    """Return interpreter-specific install guidance."""
+    current_python = f'"{sys.executable}" -m pip install "{package_spec}"'
+    if os.name == 'nt':
+        return [
+            f'  {current_python}',
+            '  # or',
+            f'  py -m pip install "{package_spec}"',
+        ]
+    return [f'  {current_python}']
+
+
+def check_python_version():
+    """Require Python runtime at or above the supported baseline."""
+    if sys.version_info >= PYTHON_RECOMMENDED:
+        return
+
+    required = '.'.join(str(x) for x in PYTHON_RECOMMENDED)
+    current = f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'
+    print(
+        f'Error: Python {required}+ is required for this script. Current interpreter: {current}',
+        file=sys.stderr
+    )
+    print('', file=sys.stderr)
+    print('Use a Python 3.10+ interpreter or create a venv with one, then install dependencies there.', file=sys.stderr)
+    print('Example:', file=sys.stderr)
+    print('  /opt/homebrew/bin/python3.13 -m venv .venv', file=sys.stderr)
+    print('  .venv/bin/python -m pip install "yt-dlp[default]" youtube-transcript-api', file=sys.stderr)
+    sys.exit(1)
+
+
+def check_yt_dlp():
+    """Check that yt-dlp is importable in this Python interpreter."""
+    if yt_dlp is not None:
+        return
+
+    print("Error: Python package 'yt-dlp' is not installed in this Python environment.", file=sys.stderr)
+    if YTDLP_IMPORT_ERROR is not None:
+        print(f"Details: {YTDLP_IMPORT_ERROR}", file=sys.stderr)
+    print('', file=sys.stderr)
+    print('Install yt-dlp into the same interpreter used to run this script:', file=sys.stderr)
+    for hint in pip_install_hint():
+        print(hint, file=sys.stderr)
+    print('', file=sys.stderr)
+    print('For more info: https://github.com/yt-dlp/yt-dlp', file=sys.stderr)
+    sys.exit(1)
+
+
+def normalize_language_code(language):
+    """Normalize language codes to lowercase + dash separator."""
+    if not language:
+        return ''
+    return language.lower().replace('_', '-').strip()
+
+
+def base_language(language):
+    """Return root language (e.g. en-us -> en)."""
+    normalized = normalize_language_code(language)
+    if '-' in normalized:
+        return normalized.split('-', 1)[0]
+    return normalized
+
+
+def is_usable_subtitle_language(language):
+    """Filter out known non-transcript subtitle tracks."""
+    normalized = normalize_language_code(language)
+    for prefix in EXCLUDED_SUBTITLE_PREFIXES:
+        if normalized.startswith(prefix):
+            return False
+    return bool(normalized)
+
+
+def language_matches_preference(language, preferred):
+    """Match exact preferred language or region variants."""
+    candidate = normalize_language_code(language)
+    pref = normalize_language_code(preferred)
+    if not candidate or not pref:
+        return False
+
+    if candidate == pref:
+        return True
+
+    # If preferred is root language (e.g. en), accept region variants (e.g. en-US).
+    if '-' not in pref and candidate.startswith(pref + '-'):
+        return True
+
+    # If preferred is region-specific (e.g. en-US), fallback to root + sibling region variants.
+    if '-' in pref:
+        pref_root = base_language(pref)
+        if candidate == pref_root or candidate.startswith(pref_root + '-'):
+            return True
+
+    return False
+
+
+def is_english_preference(language):
+    """Return True when preferred language is English or an English variant."""
+    normalized = normalize_language_code(language)
+    return normalized == 'en' or normalized.startswith('en-')
+
+
+def preferred_language_candidates(preferred):
+    """Return ordered language candidates for strict preferred-language matching."""
+    normalized = normalize_language_code(preferred)
+    if not normalized:
+        normalized = 'en'
+
+    candidates = []
+
+    def add(code):
+        code = normalize_language_code(code)
+        if code and code not in candidates:
+            candidates.append(code)
+
+    add(normalized)
+    add(base_language(normalized))
+
+    # `en-orig` is frequently available when `en` is not surfaced first.
+    if is_english_preference(normalized):
+        add('en')
+        add('en-orig')
+        add('en-us')
+        add('en-gb')
+
+    return candidates
+
+
+def slugify(value):
+    """Create a filesystem-safe slug."""
+    slug = re.sub(r'[^a-zA-Z0-9]+', '-', value).strip('-').lower()
+    return slug or 'track'
+
+
+def parse_video_id(url):
+    """Extract YouTube video id when present."""
+    parsed = urlparse(url or '')
+    host = (parsed.netloc or '').lower()
+    path = (parsed.path or '').strip('/')
+
+    if host.endswith('youtu.be') and path:
+        return path.split('/')[0]
+
+    if host.endswith('youtube.com'):
+        query_video = (parse_qs(parsed.query).get('v') or [''])[0]
+        if query_video:
+            return query_video
+
+        path_parts = path.split('/')
+        if len(path_parts) >= 2 and path_parts[0] in {'embed', 'shorts', 'live'}:
+            return path_parts[1]
+
+    match = re.search(r'(?:v=|youtu\.be/|/embed/|/shorts/|/live/)([A-Za-z0-9_-]+)', url or '')
+    if match:
+        return match.group(1)
+    return ''
+
+
+def normalize_ascii_text(value):
+    """Normalize unicode text to ASCII for deterministic filenames."""
+    normalized = unicodedata.normalize('NFKD', value or '')
+    return normalized.encode('ascii', 'ignore').decode('ascii')
+
+
+def person_name_slug(value):
+    """Convert probable human name to first-last slug."""
+    tokens = re.findall(r'[A-Za-z]+', value or '')
+    tokens = [token for token in tokens if token]
+    if len(tokens) < 2:
+        return ''
+
+    # Drop middle initials for cleaner identifiers.
+    filtered = [token for token in tokens if len(token) > 1]
+    if len(filtered) >= 2:
+        return f'{filtered[0]}-{filtered[-1]}'.lower()
+
+    return f'{tokens[0]}-{tokens[-1]}'.lower()
+
+
+def concise_brand_slug(value, max_words=3, max_len=36):
+    """Convert channel/brand string to a short slug."""
+    text = normalize_ascii_text(value).lower()
+    words = re.findall(r'[a-z0-9]+', text)
+    words = [word for word in words if word not in {'official', 'channel', 'podcast'}]
+    if not words:
+        return 'youtube'
+
+    slug = '-'.join(words[:max_words])
+    return slug[:max_len].strip('-') or 'youtube'
+
+
+def choose_identifier(channel, title):
+    """Choose canonical identifier for filename."""
+    channel = channel or ''
+    title = title or ''
+
+    interview_match = re.search(
+        r'(?:interview with|with)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,2})',
+        title
+    )
+    if interview_match:
+        slug = person_name_slug(interview_match.group(1))
+        if slug:
+            return slug
+
+    if '|' in channel:
+        tail = channel.split('|')[-1].strip()
+        slug = person_name_slug(tail)
+        if slug:
+            return slug
+        return concise_brand_slug(tail)
+
+    slug = person_name_slug(channel)
+    if slug:
+        return slug
+
+    return concise_brand_slug(channel)
+
+
+def choose_topic_keywords(title, identifier, max_keywords=3):
+    """Choose concise topic keywords for filename."""
+    stopwords = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+        'from', 'is', 'are', 'was', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does',
+        'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'this', 'that',
+        'these', 'those', 'what', 'which', 'who', 'when', 'where', 'why', 'how', 'video',
+        'podcast', 'episode', 'interview', 'talk', 'full', 'watch', 'explained'
+    }
+    identifier_tokens = set((identifier or '').split('-'))
+    title_words = re.findall(r'[a-zA-Z]{2,}', normalize_ascii_text(title).lower())
+
+    topics = []
+    for word in title_words:
+        if word in stopwords:
+            continue
+        if word in identifier_tokens:
+            continue
+        if word not in topics:
+            topics.append(word)
+        if len(topics) >= max_keywords:
+            break
+
+    return topics or ['transcript']
+
+
+def canonical_date(upload_date):
+    """Choose canonical date string for filename."""
+    if upload_date and re.match(r'^\d{4}-\d{2}-\d{2}$', upload_date):
+        return upload_date
+    return datetime.date.today().isoformat()
+
+
+def build_canonical_filename(metadata, url):
+    """Build canonical filename: YYYY-MM-DD_identifier_topic-keywords.md"""
+    title = metadata.get('title') or ''
+    channel = metadata.get('channel') or ''
+
+    identifier = choose_identifier(channel, title)
+    if not identifier:
+        video_id = parse_video_id(url)
+        identifier = slugify(video_id) if video_id else 'youtube'
+
+    topics = choose_topic_keywords(title, identifier)
+    date_part = canonical_date(metadata.get('upload_date'))
+
+    filename = f"{date_part}_{identifier}_{'-'.join(topics)}.md"
+    filename = filename.replace('--', '-')
+    return filename[:120].rstrip('-')
+
+
+def resolve_output_path(output_target, metadata, url):
+    """
+    Resolve final output path.
+
+    Rules:
+    - If target ends with `.md`, treat as explicit file path override.
+    - Otherwise treat target as output directory and auto-generate canonical filename.
+    """
+    target = (output_target or '').strip()
+    if not target:
+        raise RuntimeError('Output target is empty.')
+
+    explicit_file = target.lower().endswith('.md') and not target.endswith(os.sep)
+    if explicit_file:
+        return os.path.abspath(target), False
+
+    output_dir = os.path.abspath(target)
+    filename = build_canonical_filename(metadata, url)
+    return os.path.join(output_dir, filename), True
+
+
+def base_ydl_opts(skip_download=True, subtitle_friendly=False, network_settings=None):
+    """Common yt-dlp options."""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': skip_download,
+        'noprogress': True,
+        'noplaylist': True,
+    }
+
+    # Force clients that consistently expose subtitle inventories on recent YouTube changes.
+    if subtitle_friendly:
+        opts['extractor_args'] = {
+            'youtube': {
+                'player_client': list(YOUTUBE_SUBTITLE_PLAYER_CLIENTS),
+            }
+        }
+
+    if network_settings:
+        opts.update(network_settings)
+
+    return opts
+
+
+def format_upload_date(upload_date):
+    """Format upload date from YYYYMMDD to YYYY-MM-DD."""
+    if upload_date and len(upload_date) == 8:
+        return f"{upload_date[0:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+    return upload_date or 'N/A'
+
+
+def format_duration(duration_seconds):
+    """Format duration seconds into HH:MM:SS or MM:SS."""
+    if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+        return 'N/A'
+
+    total = int(duration_seconds)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    seconds = total % 60
+    if hours:
+        return f'{hours:d}:{minutes:02d}:{seconds:02d}'
+    return f'{minutes:02d}:{seconds:02d}'
+
+
+def normalize_chapters(chapters):
+    """Normalize chapter structure and enforce sorted start times."""
+    normalized = []
+    for chapter in chapters or []:
+        start_time = chapter.get('start_time')
+        if start_time is None:
+            continue
+
+        try:
+            start_time = float(start_time)
+        except (TypeError, ValueError):
+            continue
+
+        normalized.append({
+            'start_time': start_time,
+            'title': chapter.get('title') or 'Untitled',
+        })
+
+    normalized.sort(key=lambda item: item['start_time'])
+    return normalized
+
+
+def extract_video_info(url, network_settings):
+    """Extract full info object via yt-dlp without downloading media."""
+    try:
+        with yt_dlp.YoutubeDL(
+            base_ydl_opts(skip_download=True, subtitle_friendly=True, network_settings=network_settings)
+        ) as ydl:
+            return ydl.extract_info(url, download=False)
+    except DownloadError as error:
+        raise RuntimeError(
+            f'Failed to extract metadata from YouTube.\nDetails: {redact_sensitive_text(str(error))}'
+        ) from error
+
+
+def build_metadata(info):
+    """Build normalized metadata object from yt-dlp info."""
+    duration = info.get('duration')
+    return {
+        'title': info.get('title', 'N/A'),
+        'channel': info.get('uploader') or info.get('channel') or 'N/A',
+        'upload_date': format_upload_date(info.get('upload_date')),
+        'duration': duration or 0,
+        'duration_string': info.get('duration_string') or format_duration(duration),
+        'chapters': normalize_chapters(info.get('chapters', [])),
+    }
+
+
+def build_fallback_metadata(url):
+    """Fallback metadata when video metadata cannot be retrieved."""
+    video_id = parse_video_id(url)
+
+    title_suffix = f' ({video_id})' if video_id else ''
+    return {
+        'title': f'YouTube Transcript{title_suffix}',
+        'channel': 'N/A',
+        'upload_date': 'N/A',
+        'duration': 0,
+        'duration_string': 'N/A',
+        'chapters': [],
+    }
+
+
+def available_subtitle_inventory(info):
+    """Return manual/automatic subtitle language inventory."""
+    manual = sorted(
+        lang for lang in (info.get('subtitles') or {}).keys()
+        if is_usable_subtitle_language(lang)
+    )
+    automatic = sorted(
+        lang for lang in (info.get('automatic_captions') or {}).keys()
+        if is_usable_subtitle_language(lang)
+    )
+    return {
+        'manual': manual,
+        'automatic': automatic,
+    }
+
+
+def ordered_languages(languages, preferred):
+    """Order languages by preferred-language candidates only (no any-language fallback)."""
+    ordered = []
+    seen = set()
+
+    for candidate in preferred_language_candidates(preferred):
+        for language in languages:
+            if language in seen:
+                continue
+            if language_matches_preference(language, candidate):
+                seen.add(language)
+                ordered.append(language)
+
+    return ordered
+
+
+def build_subtitle_attempts(info, preferred_language):
+    """Build strict preferred-language subtitle attempts in deterministic order."""
+    inventory = available_subtitle_inventory(info)
+
+    manual_order = ordered_languages(
+        inventory['manual'],
+        preferred_language,
+    )
+    automatic_order = ordered_languages(
+        inventory['automatic'],
+        preferred_language,
+    )
+
+    attempts = []
+    for language in manual_order:
+        attempts.append({'mode': 'manual', 'language': language})
+
+    for language in automatic_order:
+        attempts.append({'mode': 'auto', 'language': language})
+
+    return attempts, inventory
+
+
+def subtitle_inventory_summary(inventory):
+    """Build human-readable inventory summary."""
+    manual = ', '.join(inventory.get('manual') or []) or 'none'
+    automatic = ', '.join(inventory.get('automatic') or []) or 'none'
+    return f'Manual subtitles: {manual}\nAutomatic captions: {automatic}'
+
+
+def clear_temp_vtt_files(prefix):
+    """Clear existing temp subtitle files for a given prefix."""
+    for path in glob.glob(prefix + '*.vtt'):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def choose_vtt_file(prefix, preferred_language):
+    """Pick the most relevant downloaded VTT file."""
+    candidates = sorted(glob.glob(prefix + '*.vtt'))
+    if not candidates:
+        return None
+
+    preferred = normalize_language_code(preferred_language)
+    for candidate in candidates:
+        lowered = candidate.lower()
+        if f'.{preferred}.vtt' in lowered or f'.{preferred.replace("-", "_")}.vtt' in lowered:
+            return candidate
+
+    preferred_root = base_language(preferred)
+    for candidate in candidates:
+        lowered = candidate.lower()
+        if f'.{preferred_root}-' in lowered or f'.{preferred_root}_' in lowered:
+            return candidate
+
+    return candidates[0]
+
+
+def js_runtime_guidance(download_error_message):
+    """Return guidance when yt-dlp reports JavaScript runtime requirements."""
+    lowered = download_error_message.lower()
+    markers = ['yt-dlp-ejs', 'js runtime', 'jsruntime', 'quickjs', 'dukpy', 'deno', 'nodejs']
+    if not any(marker in lowered for marker in markers):
+        return None
+
+    lines = [
+        'YouTube extraction currently requires a JavaScript runtime for yt-dlp.',
+        'Install/update yt-dlp extras and runtime in this environment:',
+    ]
+    for hint in pip_install_hint(package_spec='yt-dlp[default]'):
+        lines.append(hint)
+    lines.append('Then ensure a JS runtime is available (recommended: Deno).')
+    return '\n'.join(lines)
+
+
+def attempt_subtitle_download(url, temp_dir, attempt, index, network_settings):
+    """Try one subtitle provider attempt and return path to downloaded VTT."""
+    language = attempt['language']
+    mode = attempt['mode']
+    prefix = os.path.join(temp_dir, f'transcript_{index:02d}_{mode}_{slugify(language)}')
+
+    clear_temp_vtt_files(prefix)
+
+    opts = base_ydl_opts(skip_download=True, subtitle_friendly=True, network_settings=network_settings)
+    opts.update({
+        'writesubtitles': True,
+        'writeautomaticsub': (mode == 'auto'),
+        'subtitleslangs': [language],
+        'subtitlesformat': 'vtt/best',
+        'outtmpl': prefix + '.%(ext)s',
+    })
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(url, download=True)
+
+    return choose_vtt_file(prefix, language)
+
+
+def parse_timestamp_to_seconds(timestamp_text):
+    """Parse VTT timestamp into float seconds."""
+    raw = timestamp_text.strip().replace(',', '.')
+    if not raw:
+        return None
+
+    parts = raw.split(':')
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600 + minutes * 60 + seconds
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60 + seconds
+    except ValueError:
+        return None
+
+    return None
+
+
+def parse_vtt(vtt_path):
+    """
+    Parse VTT file and extract clean transcript text with timestamps.
+
+    Returns list of dicts: [{'start': seconds, 'text': 'clean text'}, ...]
+    """
+    try:
+        with open(vtt_path, 'r', encoding='utf-8') as handle:
+            content = handle.read()
+    except OSError as error:
+        raise RuntimeError(f'Failed to read VTT file: {error}') from error
+
+    # Normalize line endings and remove leading BOM.
+    content = content.replace('\r\n', '\n').replace('\ufeff', '')
+    blocks = re.split(r'\n\s*\n', content)
+
+    entries = []
+    for block in blocks:
+        lines = [line.strip() for line in block.split('\n') if line.strip()]
+        if not lines:
+            continue
+
+        timestamp_index = -1
+        for idx, line in enumerate(lines):
+            if '-->' in line:
+                timestamp_index = idx
+                break
+
+        if timestamp_index == -1:
+            continue
+
+        timestamp_line = lines[timestamp_index]
+        cue_text_lines = lines[timestamp_index + 1:]
+        if not cue_text_lines:
+            continue
+
+        start_stamp = timestamp_line.split('-->', 1)[0].strip()
+        start_seconds = parse_timestamp_to_seconds(start_stamp)
+        if start_seconds is None:
+            continue
+
+        text = ' '.join(cue_text_lines)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        if text:
+            entries.append({'start': start_seconds, 'text': text})
+
+    if not entries:
+        warn('No transcript entries found in VTT file.')
+
+    return entries
+
+
+def download_audio_for_asr(url, temp_dir, network_settings):
+    """Download audio track to local temp file for ASR fallback."""
+    outtmpl = os.path.join(temp_dir, 'asr_audio.%(ext)s')
+
+    opts = base_ydl_opts(skip_download=False, network_settings=network_settings)
+    opts.update({
+        'format': 'bestaudio/best',
+        'outtmpl': outtmpl,
+    })
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+        requested_downloads = info.get('requested_downloads') or []
+        if requested_downloads:
+            filepath = requested_downloads[0].get('filepath')
+            if filepath and os.path.exists(filepath):
+                return filepath
+
+        prepared = ydl.prepare_filename(info)
+        if prepared and os.path.exists(prepared):
+            return prepared
+
+    raise RuntimeError('Failed to download audio file for ASR fallback.')
+
+
+def run_asr_fallback(url, temp_dir, preferred_language, model_name, network_settings):
+    """Run Whisper-based ASR fallback and return transcript entries."""
+    try:
+        import whisper
+    except ModuleNotFoundError as error:
+        message_lines = [
+            'ASR fallback requested, but openai-whisper is not installed in this environment.',
+            'Install dependencies:',
+        ]
+        for hint in pip_install_hint(package_spec='openai-whisper'):
+            message_lines.append(hint)
+        message_lines.append('Also ensure ffmpeg is installed and available on PATH.')
+        raise RuntimeError('\n'.join(message_lines)) from error
+
+    audio_path = download_audio_for_asr(url, temp_dir, network_settings)
+
+    try:
+        model = whisper.load_model(model_name)
+        transcribe_opts = {'task': 'transcribe'}
+
+        language_root = base_language(preferred_language)
+        if len(language_root) == 2:
+            transcribe_opts['language'] = language_root
+
+        result = model.transcribe(audio_path, **transcribe_opts)
+    except Exception as error:
+        raise RuntimeError(
+            'ASR fallback failed while transcribing audio. '
+            'Ensure ffmpeg is installed and ASR model dependencies are available. '
+            f'Details: {error}'
+        ) from error
+
+    segments = result.get('segments') or []
+    entries = []
+    for segment in segments:
+        text = (segment.get('text') or '').strip()
+        start = segment.get('start')
+        if not text or start is None:
+            continue
+
+        try:
+            start_seconds = float(start)
+        except (TypeError, ValueError):
+            continue
+
+        entries.append({'start': start_seconds, 'text': text})
+
+    if not entries:
+        raise RuntimeError('ASR fallback produced no transcript segments.')
+
+    return entries
+
+
+def run_youtube_transcript_api_fallback(video_id, preferred_language, proxy_settings):
+    """Fallback transcript provider via youtube-transcript-api (strict preferred language)."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api.proxies import GenericProxyConfig
+    except ModuleNotFoundError as error:
+        message_lines = [
+            'youtube-transcript-api fallback is unavailable because the package is not installed.',
+            'Install dependency:',
+        ]
+        for hint in pip_install_hint(package_spec='youtube-transcript-api'):
+            message_lines.append(hint)
+        raise RuntimeError('\n'.join(message_lines)) from error
+
+    proxy_config = None
+    if proxy_settings:
+        try:
+            proxy_config = GenericProxyConfig(
+                http_url=proxy_settings.get('http_url'),
+                https_url=proxy_settings.get('https_url'),
+            )
+        except Exception as error:
+            raise RuntimeError(f'Invalid proxy settings for transcript API fallback: {error}') from error
+
+    api = YouTubeTranscriptApi(proxy_config=proxy_config)
+    language_codes = preferred_language_candidates(preferred_language)
+
+    try:
+        fetched = api.fetch(video_id, languages=language_codes)
+    except Exception as error:
+        raise RuntimeError(
+            f'youtube-transcript-api could not fetch transcript. Details: {redact_sensitive_text(str(error))}'
+        ) from error
+
+    entries = []
+    for snippet in fetched:
+        text = re.sub(r'\s+', ' ', (getattr(snippet, 'text', '') or '').strip())
+        start = getattr(snippet, 'start', None)
+        if not text or start is None:
+            continue
+
+        try:
+            start_seconds = float(start)
+        except (TypeError, ValueError):
+            continue
+
+        entries.append({'start': start_seconds, 'text': text})
+
+    if not entries:
+        raise RuntimeError('youtube-transcript-api returned no transcript entries.')
+
+    language = getattr(fetched, 'language_code', None) or language_codes[0]
+    is_generated = bool(getattr(fetched, 'is_generated', False))
+    mode = 'auto' if is_generated else 'manual'
+    source = f'youtube-transcript-api:{mode}:{normalize_language_code(language)}'
+
+    return entries, source
+
+
+def extract_transcript_with_fallback_chain(url, info, args, temp_dir, network_settings, transcript_api_proxy_settings):
+    """
+    Transcript provider chain:
+    1) Manual preferred language subtitles
+    2) Auto preferred language subtitles
+    3) youtube-transcript-api preferred-language fallback
+    4) Optional ASR fallback
+    """
+    attempts, inventory = build_subtitle_attempts(
+        info,
+        preferred_language=args.lang,
+    )
+
+    attempt_errors = []
+
+    for index, attempt in enumerate(attempts, start=1):
+        label = f"{attempt['mode']}:{attempt['language']}"
+
+        try:
+            vtt_path = attempt_subtitle_download(
+                url=url,
+                temp_dir=temp_dir,
+                attempt=attempt,
+                index=index,
+                network_settings=network_settings,
+            )
+        except DownloadError as error:
+            details = redact_sensitive_text(str(error))
+            guidance = js_runtime_guidance(details)
+            if guidance:
+                raise TranscriptExtractionError(
+                    'Failed to download transcript from YouTube.\n'
+                    f'Details: {details}\n\n{guidance}'
+                ) from error
+
+            attempt_errors.append(f'{label} failed: {details}')
+            continue
+
+        if not vtt_path:
+            attempt_errors.append(f'{label} failed: no VTT file produced')
+            continue
+
+        entries = parse_vtt(vtt_path)
+        if entries:
+            return {
+                'entries': entries,
+                'source': label,
+                'inventory': inventory,
+                'warnings': attempt_errors,
+            }
+
+        attempt_errors.append(f'{label} failed: parsed transcript was empty')
+
+    video_id = parse_video_id(url)
+    if video_id:
+        try:
+            api_entries, api_source = run_youtube_transcript_api_fallback(
+                video_id=video_id,
+                preferred_language=args.lang,
+                proxy_settings=transcript_api_proxy_settings,
+            )
+            return {
+                'entries': api_entries,
+                'source': api_source,
+                'inventory': inventory,
+                'warnings': attempt_errors,
+            }
+        except RuntimeError as error:
+            attempt_errors.append(f'youtube-transcript-api fallback failed: {error}')
+
+    if args.asr_fallback:
+        asr_entries = run_asr_fallback(
+            url=url,
+            temp_dir=temp_dir,
+            preferred_language=args.lang,
+            model_name=args.asr_model,
+            network_settings=network_settings,
+        )
+        return {
+            'entries': asr_entries,
+            'source': f'asr:{args.asr_model}',
+            'inventory': inventory,
+            'warnings': attempt_errors,
+        }
+
+    failure_lines = [
+        'No transcript entries were extracted from subtitle providers.',
+        subtitle_inventory_summary(inventory),
+    ]
+
+    if not attempts:
+        failure_lines.append(
+            f'No subtitle tracks matched preferred language "{args.lang}". '
+            'Retry with --asr-fallback.'
+        )
+
+    if attempt_errors:
+        failure_lines.append('Attempt details:')
+        failure_lines.extend(f'- {entry}' for entry in attempt_errors[:5])
+
+    raise TranscriptExtractionError('\n'.join(failure_lines))
+
+
+def deduplicate_transcript(entries):
+    """
+    Deduplicate transcript entries that have overlapping text.
+
+    VTT files often repeat text in consecutive entries. This function
+    removes duplicates while preserving the narrative flow.
+    """
+    if not entries:
+        return []
+
+    deduped = []
+    prev_text = ''
+
+    for entry in entries:
+        text = entry['text']
+
+        # Skip if this text is very similar to or contained in the previous text
+        # (handles VTT overlapping context).
+        if prev_text and (text in prev_text or prev_text in text):
+            if len(text) > len(prev_text) and deduped:
+                deduped[-1]['text'] = text
+            continue
+
+        deduped.append(entry)
+        prev_text = text
+
+    return deduped
+
+
+def remove_word_duplicates(text):
+    """
+    Remove duplicate words/phrases that appear consecutively.
+
+    VTT transcripts often have overlapping context that creates duplicates like:
+    "Hello world Hello world again" -> "Hello world again"
+    """
+    words = text.split()
+    cleaned = []
+    i = 0
+
+    while i < len(words):
+        found_duplicate = False
+
+        # Check for repeating sequences of 3-10 words.
+        for seq_len in range(min(10, len(words) - i), 2, -1):
+            if i + seq_len * 2 <= len(words):
+                seq1 = words[i:i + seq_len]
+                seq2 = words[i + seq_len:i + seq_len * 2]
+
+                if seq1 == seq2:
+                    i += seq_len
+                    found_duplicate = True
+                    break
+
+        if not found_duplicate:
+            cleaned.append(words[i])
+            i += 1
+
+    return ' '.join(cleaned)
+
+
+def organize_by_chapters(transcript_entries, chapters, skip_chapters):
+    """
+    Organize transcript entries into chapter sections.
+
+    Returns list: [{'timestamp': str, 'title': str, 'text': str}, ...]
+    """
+    transcript_entries = deduplicate_transcript(transcript_entries)
+
+    if skip_chapters or not chapters:
+        all_text = ' '.join(entry['text'] for entry in transcript_entries)
+        all_text = remove_word_duplicates(all_text)
+        return [{'timestamp': '00:00', 'title': 'Transcript', 'text': all_text}]
+
+    chapter_sections = []
+    for index, chapter in enumerate(chapters):
+        start_time = chapter['start_time']
+        end_time = chapters[index + 1]['start_time'] if index + 1 < len(chapters) else float('inf')
+
+        minutes = int(start_time // 60)
+        seconds = int(start_time % 60)
+        timestamp = f'{minutes:02d}:{seconds:02d}'
+
+        chapter_text = []
+        for entry in transcript_entries:
+            if start_time <= entry['start'] < end_time:
+                chapter_text.append(entry['text'])
+
+        if chapter_text:
+            chapter_text_str = ' '.join(chapter_text)
+            chapter_text_str = remove_word_duplicates(chapter_text_str)
+            chapter_sections.append({
+                'timestamp': timestamp,
+                'title': chapter['title'],
+                'text': chapter_text_str,
+            })
+
+    if chapter_sections:
+        return chapter_sections
+
+    all_text = ' '.join(entry['text'] for entry in transcript_entries)
+    all_text = remove_word_duplicates(all_text)
+    return [{'timestamp': '00:00', 'title': 'Transcript', 'text': all_text}]
+
+
+def fallback_transcript_section(reason):
+    """Build transcript body section when providers fail."""
+    reason = reason.strip() or 'Unknown extraction error.'
+    reason = re.sub(r'\s+', ' ', reason)
+    max_len = 1200
+    if len(reason) > max_len:
+        reason = reason[:max_len].rstrip() + '...'
+
+    text = (
+        'Transcript could not be extracted automatically for this video. '
+        'The artifact was still generated to preserve metadata and workflow continuity.\n\n'
+        f'Extraction details: {reason}'
+    )
+    return [{'timestamp': '00:00', 'title': 'Transcript', 'text': text}]
+
+
+def generate_summary(transcript_text):
+    """
+    Generate a simple summary from transcript text.
+
+    Uses first ~500 characters as a basic summary.
+    """
+    if not transcript_text:
+        return 'Summary unavailable.'
+
+    summary = transcript_text[:500]
+    last_period = summary.rfind('.')
+    if last_period > 200:
+        summary = summary[:last_period + 1]
+
+    return summary.strip() or 'Summary unavailable.'
+
+
+def extract_topics(title, transcript_text):
+    """
+    Extract topic keywords from title and transcript.
+
+    Returns list of up to 8 topic keywords.
+    """
+    del transcript_text  # Reserved for richer topic extraction.
+
+    filler_words = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+        'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'been', 'be',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these',
+        'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'which',
+        'who', 'when', 'where', 'why', 'how'
+    }
+
+    words = re.findall(r'\b[a-zA-Z]{2,}\b', (title or '').lower())
+    topics = [word for word in words if word not in filler_words]
+    return topics[:8] if topics else ['youtube', 'video']
+
+
+def format_markdown(metadata, sections, summary, topics, url, include_chapters):
+    """Format markdown in the canonical transcript artifact structure."""
+    lines = []
+
+    lines.append(f"# {metadata['title']}")
+    lines.append('')
+    lines.append(f'**Source:** [YouTube Video]({url})')
+    lines.append(f"**Speaker/Channel:** {metadata['channel']}")
+    lines.append(f"**Published:** {metadata['upload_date']}")
+    lines.append(f"**Duration:** {metadata['duration_string']}")
+    lines.append('**Type:** Video Transcript')
+    lines.append('')
+
+    lines.append(f'**Summary:** {summary}')
+    lines.append('')
+
+    lines.append(f"**Topics:** {', '.join(topics)}")
+    lines.append('')
+
+    if include_chapters and metadata['chapters']:
+        lines.append('**Chapters:**')
+        for chapter in metadata['chapters']:
+            start_time = chapter['start_time']
+            minutes = int(start_time // 60)
+            seconds = int(start_time % 60)
+            timestamp = f'{minutes:02d}:{seconds:02d}'
+            lines.append(f"- [{timestamp}] {chapter['title']}")
+        lines.append('')
+
+    lines.append('---')
+    lines.append('')
+
+    include_section_headers = include_chapters and len(sections) > 1
+    for section in sections:
+        if include_section_headers:
+            lines.append(f"## [{section['timestamp']}] {section['title']}")
+            lines.append('')
+
+        lines.append(section['text'])
+        lines.append('')
+
+    return '\n'.join(lines)
+
+
+def save_file(content, output_path):
+    """Save markdown content atomically to file."""
+    output_path = os.path.abspath(output_path)
+    output_dir = os.path.dirname(output_path)
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix='.tmp_yt_transcript_', suffix='.md', dir=output_dir or None)
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+            handle.write(content)
+
+        os.replace(temp_path, output_path)
+        print(f'Success: Transcript saved to {output_path}')
+    except OSError as error:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise RuntimeError(f'Failed to save file: {error}') from error
+
+
+def main():
+    """Main orchestration function."""
+    args = parse_args()
+
+    if not validate_youtube_url(args.url):
+        print(f'Error: Invalid YouTube URL: {args.url}', file=sys.stderr)
+        print('', file=sys.stderr)
+        print('Expected formats:', file=sys.stderr)
+        print('  https://www.youtube.com/watch?v=VIDEO_ID', file=sys.stderr)
+        print('  https://youtu.be/VIDEO_ID', file=sys.stderr)
+        return 1
+
+    check_python_version()
+    check_yt_dlp()
+
+    try:
+        validate_runtime_args(args)
+    except RuntimeError as error:
+        print(f'Error: {redact_sensitive_text(str(error))}', file=sys.stderr)
+        return 1
+
+    ytdlp_network_settings = build_ytdlp_network_settings(args)
+    transcript_api_proxy_settings = build_transcript_api_proxy_settings(args)
+
+    metadata = None
+    info = None
+    sections = None
+    extraction_failure = None
+    provider_source = None
+
+    try:
+        print(f'Extracting metadata from {args.url}...', file=sys.stderr)
+        info = extract_video_info(args.url, ytdlp_network_settings)
+        metadata = build_metadata(info)
+
+        print('Extracting transcript...', file=sys.stderr)
+        with tempfile.TemporaryDirectory(prefix='yt_transcript_') as temp_dir:
+            transcript_result = extract_transcript_with_fallback_chain(
+                args.url,
+                info,
+                args,
+                temp_dir,
+                ytdlp_network_settings,
+                transcript_api_proxy_settings,
+            )
+
+        provider_source = transcript_result['source']
+        for warning_message in transcript_result['warnings']:
+            warn(warning_message)
+
+        entries = transcript_result['entries']
+        sections = organize_by_chapters(entries, metadata['chapters'], args.no_chapters)
+
+    except KeyboardInterrupt:
+        print('\nOperation cancelled by user.', file=sys.stderr)
+        return 130
+    except (RuntimeError, TranscriptExtractionError) as error:
+        if args.no_artifact_on_failure:
+            print(f'Error: {redact_sensitive_text(str(error))}', file=sys.stderr)
+            return 1
+
+        extraction_failure = redact_sensitive_text(str(error))
+
+        if metadata is None:
+            metadata = build_fallback_metadata(args.url)
+
+        sections = fallback_transcript_section(extraction_failure)
+        warn('Transcript extraction failed; writing artifact with failure details.')
+
+    try:
+        all_text = ' '.join(section['text'] for section in sections)
+        summary = generate_summary(all_text)
+        topics = extract_topics(metadata['title'], all_text)
+
+        include_chapters = (extraction_failure is None) and (not args.no_chapters) and bool(metadata['chapters'])
+        markdown_content = format_markdown(
+            metadata=metadata,
+            sections=sections,
+            summary=summary,
+            topics=topics,
+            url=args.url,
+            include_chapters=include_chapters,
+        )
+
+        resolved_output_path, auto_named = resolve_output_path(args.output_target, metadata, args.url)
+        if auto_named:
+            print(f'Resolved filename: {os.path.basename(resolved_output_path)}', file=sys.stderr)
+
+        save_file(markdown_content, resolved_output_path)
+
+        if provider_source:
+            print(f'Transcript source: {provider_source}', file=sys.stderr)
+
+        if extraction_failure:
+            print('Artifact contains extraction failure notes. Re-run with one of:', file=sys.stderr)
+            print('  --asr-fallback --asr-model small', file=sys.stderr)
+
+        return 0
+
+    except RuntimeError as error:
+        print(f'Error: {redact_sensitive_text(str(error))}', file=sys.stderr)
+        return 1
+    except Exception as error:  # defensive catch for unexpected failures
+        print(f'Unexpected error: {redact_sensitive_text(str(error))}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
