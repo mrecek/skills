@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+"""CLI utilities for reading and editing draw.io (.drawio/.xml) diagram files.
+
+Supports both storage modes for each <diagram> page:
+- uncompressed: <diagram><mxGraphModel>...</mxGraphModel></diagram>
+- compressed:   <diagram>Base64(deflateRaw(encodeURIComponent(mxGraphModel XML)))</diagram>
+"""
+
+import argparse
+import base64
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.parse
+import xml.etree.ElementTree as ET
+import zlib
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+
+def _die(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _read_xml(path: str) -> ET.ElementTree:
+    try:
+        return ET.parse(path)
+    except ET.ParseError as exc:
+        _die(f"invalid XML in {path}: {exc}")
+    except FileNotFoundError:
+        _die(f"file not found: {path}")
+
+
+def _write_xml(tree: ET.ElementTree, path: str) -> None:
+    try:
+        ET.indent(tree, space="  ")
+    except Exception:
+        pass
+    tree.write(path, encoding="utf-8", xml_declaration=False)
+
+
+def _norm_path(path: str) -> str:
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _guard_output_path(input_path: str, output_path: str, in_place: bool, force: bool) -> None:
+    in_norm = _norm_path(input_path)
+    out_norm = _norm_path(output_path)
+    same_path = in_norm == out_norm
+
+    if same_path and not in_place:
+        _die("refusing in-place overwrite; pass --in-place to allow input==output")
+
+    if os.path.exists(output_path) and not force and not same_path:
+        _die(f"output file already exists: {output_path} (use --force to overwrite)")
+
+
+def _make_backup(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = f"{path}.bak.{stamp}"
+    if os.path.exists(candidate):
+        idx = 1
+        while os.path.exists(f"{candidate}.{idx}"):
+            idx += 1
+        candidate = f"{candidate}.{idx}"
+
+    shutil.copy2(path, candidate)
+    return candidate
+
+
+def _get_diagrams(root: ET.Element) -> List[ET.Element]:
+    diagrams = root.findall("diagram")
+    if not diagrams:
+        _die("mxfile does not contain any <diagram> pages")
+    return diagrams
+
+
+def _compress_model_xml(model_xml: str) -> str:
+    encoded = urllib.parse.quote(model_xml, safe="~()*!.'")
+    raw = zlib.compressobj(level=9, wbits=-15)
+    data = raw.compress(encoded.encode("utf-8")) + raw.flush()
+    return base64.b64encode(data).decode("ascii")
+
+
+def _decompress_model_xml(payload: str) -> str:
+    try:
+        data = base64.b64decode(payload)
+        inflated = zlib.decompress(data, -15)
+        return urllib.parse.unquote(inflated.decode("utf-8"))
+    except Exception as exc:
+        _die(f"failed to decode compressed diagram payload: {exc}")
+
+
+def _extract_model_xml(diagram: ET.Element) -> Tuple[str, str]:
+    model = diagram.find("mxGraphModel")
+    if model is not None:
+        return ET.tostring(model, encoding="unicode"), "uncompressed"
+
+    payload = "".join(diagram.itertext()).strip()
+    if not payload:
+        _die("encountered empty compressed <diagram> payload")
+    return _decompress_model_xml(payload), "compressed"
+
+
+def _set_diagram_model_xml(diagram: ET.Element, model_xml: str, storage: str) -> None:
+    if storage not in {"compressed", "uncompressed"}:
+        _die(f"unexpected storage mode: {storage}")
+
+    for child in list(diagram):
+        diagram.remove(child)
+    diagram.text = None
+
+    if storage == "uncompressed":
+        try:
+            model = ET.fromstring(model_xml)
+        except ET.ParseError as exc:
+            _die(f"cannot write invalid mxGraphModel XML: {exc}")
+        if model.tag != "mxGraphModel":
+            _die(f"expected mxGraphModel root, got {model.tag}")
+        diagram.append(model)
+    else:
+        diagram.text = _compress_model_xml(model_xml)
+
+
+def _parse_model(model_xml: str) -> ET.Element:
+    try:
+        model = ET.fromstring(model_xml)
+    except ET.ParseError as exc:
+        _die(f"invalid mxGraphModel payload: {exc}")
+    if model.tag != "mxGraphModel":
+        _die(f"expected mxGraphModel root, got {model.tag}")
+    return model
+
+
+def _find_root(model: ET.Element) -> ET.Element:
+    root = model.find("root")
+    if root is None:
+        _die("mxGraphModel missing <root>")
+    return root
+
+
+def _page_records(tree: ET.ElementTree) -> List[Dict[str, object]]:
+    root = tree.getroot()
+    if root.tag != "mxfile":
+        _die(f"expected <mxfile> root, got <{root.tag}>")
+
+    records: List[Dict[str, object]] = []
+    for idx, diagram in enumerate(_get_diagrams(root), start=1):
+        model_xml, storage = _extract_model_xml(diagram)
+        model = _parse_model(model_xml)
+        graph_root = _find_root(model)
+        cells = graph_root.findall("mxCell")
+
+        vertex = sum(1 for c in cells if c.get("vertex") == "1")
+        edge = sum(1 for c in cells if c.get("edge") == "1")
+
+        records.append(
+            {
+                "index": idx,
+                "name": diagram.get("name") or f"Page {idx}",
+                "id": diagram.get("id") or "",
+                "storage": storage,
+                "cells": len(cells),
+                "vertex": vertex,
+                "edge": edge,
+            }
+        )
+    return records
+
+
+def _render_summary(records: Sequence[Dict[str, object]]) -> None:
+    header = ["idx", "name", "storage", "cells", "vertex", "edge"]
+    rows = [
+        [
+            str(r["index"]),
+            str(r["name"]),
+            str(r["storage"]),
+            str(r["cells"]),
+            str(r["vertex"]),
+            str(r["edge"]),
+        ]
+        for r in records
+    ]
+
+    widths = [len(col) for col in header]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(row: Sequence[str]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+
+    print(fmt(header))
+    print(fmt(["-" * w for w in widths]))
+    for row in rows:
+        print(fmt(row))
+
+
+def _parse_style(style: str) -> Tuple[List[str], List[Tuple[str, str]]]:
+    bare: List[str] = []
+    kv: List[Tuple[str, str]] = []
+    for token in style.split(";"):
+        t = token.strip()
+        if not t:
+            continue
+        if "=" in t:
+            k, v = t.split("=", 1)
+            kv.append((k, v))
+        else:
+            bare.append(t)
+    return bare, kv
+
+
+def _format_style(bare: Sequence[str], kv: Sequence[Tuple[str, str]]) -> str:
+    tokens = list(bare) + [f"{k}={v}" for (k, v) in kv]
+    return (";".join(tokens) + ";") if tokens else ""
+
+
+def _set_style_keys(
+    style: str,
+    set_pairs: Sequence[Tuple[str, str]],
+    remove_keys: Sequence[str],
+) -> str:
+    bare, kv = _parse_style(style)
+    remove_set = {k for k in remove_keys}
+
+    filtered: List[Tuple[str, str]] = []
+    seen: Dict[str, int] = {}
+    for k, v in kv:
+        if k in remove_set:
+            continue
+        if k not in seen:
+            seen[k] = len(filtered)
+            filtered.append((k, v))
+
+    for k, v in set_pairs:
+        if k in seen:
+            filtered[seen[k]] = (k, v)
+        else:
+            seen[k] = len(filtered)
+            filtered.append((k, v))
+
+    return _format_style(bare, filtered)
+
+
+def _style_lookup(style: str) -> Tuple[List[str], Dict[str, str]]:
+    bare, kv = _parse_style(style)
+    d: Dict[str, str] = {}
+    for k, v in kv:
+        if k not in d:
+            d[k] = v
+    return bare, d
+
+
+def _parse_key_value_pairs(values: Optional[Sequence[str]], label: str) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    if not values:
+        return pairs
+    for raw in values:
+        if "=" not in raw:
+            _die(f"{label} entry must be key=value, got: {raw}")
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key:
+            _die(f"{label} entry has empty key: {raw}")
+        pairs.append((key, value))
+    return pairs
+
+
+def _select_pages(diagrams: Sequence[ET.Element], page: Optional[int]) -> List[Tuple[int, ET.Element]]:
+    if page is None:
+        return list(enumerate(diagrams, start=1))
+    if page < 1 or page > len(diagrams):
+        _die(f"page index out of range: {page} (pages: 1..{len(diagrams)})")
+    return [(page, diagrams[page - 1])]
+
+
+def _load_page_models(diagrams: Sequence[ET.Element]) -> Dict[int, Tuple[ET.Element, str]]:
+    page_models: Dict[int, Tuple[ET.Element, str]] = {}
+    for idx, diagram in enumerate(diagrams, start=1):
+        model_xml, storage = _extract_model_xml(diagram)
+        page_models[idx] = (_parse_model(model_xml), storage)
+    return page_models
+
+
+def _save_page_models(
+    diagrams: Sequence[ET.Element],
+    page_models: Dict[int, Tuple[ET.Element, str]],
+    storage_mode: str,
+) -> None:
+    for idx, diagram in enumerate(diagrams, start=1):
+        model, source_storage = page_models[idx]
+        model_xml = ET.tostring(model, encoding="unicode")
+        target_storage = source_storage if storage_mode == "preserve" else storage_mode
+        _set_diagram_model_xml(diagram, model_xml, target_storage)
+
+
+def _apply_cell_edit(
+    cell: ET.Element,
+    set_value: Optional[str],
+    append_value: Optional[str],
+    set_pairs: Sequence[Tuple[str, str]],
+    remove_keys: Sequence[str],
+) -> bool:
+    before = ET.tostring(cell, encoding="unicode")
+
+    if set_value is not None:
+        cell.set("value", set_value)
+    if append_value is not None:
+        current = cell.get("value") or ""
+        cell.set("value", current + append_value)
+
+    if set_pairs or remove_keys:
+        style = cell.get("style") or ""
+        cell.set("style", _set_style_keys(style, set_pairs, remove_keys))
+
+    after = ET.tostring(cell, encoding="unicode")
+    return before != after
+
+
+def _ensure_change_request(
+    set_value: Optional[str],
+    append_value: Optional[str],
+    set_pairs: Sequence[Tuple[str, str]],
+    remove_keys: Sequence[str],
+) -> None:
+    if set_value is None and append_value is None and not set_pairs and not remove_keys:
+        _die("no cell changes requested; provide --set-value, --append-value, --set-style, or --remove-style")
+
+
+def _write_with_optional_backup(
+    tree: ET.ElementTree,
+    output_path: str,
+    backup: bool,
+) -> Optional[str]:
+    backup_path = _make_backup(output_path) if backup else None
+    _write_xml(tree, output_path)
+    return backup_path
+
+
+def _parse_hex_color(raw: str) -> Optional[Tuple[int, int, int]]:
+    s = raw.strip().lower()
+    if not s.startswith("#"):
+        return None
+    h = s[1:]
+    if len(h) == 3:
+        try:
+            r = int(h[0] * 2, 16)
+            g = int(h[1] * 2, 16)
+            b = int(h[2] * 2, 16)
+            return (r, g, b)
+        except ValueError:
+            return None
+    if len(h) == 6:
+        try:
+            r = int(h[0:2], 16)
+            g = int(h[2:4], 16)
+            b = int(h[4:6], 16)
+            return (r, g, b)
+        except ValueError:
+            return None
+    return None
+
+
+def _luminance(rgb: Tuple[int, int, int]) -> float:
+    def channel(c: int) -> float:
+        x = c / 255.0
+        return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
+
+    r, g, b = rgb
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def _contrast_ratio(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> float:
+    l1 = _luminance(a)
+    l2 = _luminance(b)
+    hi = max(l1, l2)
+    lo = min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _is_neutral(rgb: Tuple[int, int, int], tolerance: int = 18) -> bool:
+    r, g, b = rgb
+    return abs(r - g) <= tolerance and abs(g - b) <= tolerance and abs(r - b) <= tolerance
+
+
+def _normalize_hex(raw: str) -> Optional[str]:
+    rgb = _parse_hex_color(raw)
+    if rgb is None:
+        return None
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def _cell_geometry(cell: ET.Element) -> Dict[str, Optional[float]]:
+    geom = cell.find("mxGeometry")
+    if geom is None:
+        return {"x": None, "y": None, "width": None, "height": None}
+
+    out: Dict[str, Optional[float]] = {"x": None, "y": None, "width": None, "height": None}
+    for key in out.keys():
+        raw = geom.get(key)
+        if raw is None:
+            continue
+        try:
+            out[key] = float(raw)
+        except ValueError:
+            out[key] = None
+    return out
+
+
+def _truncate(value: str, limit: int) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)] + "…"
+
+
+def _find_matching_paren(text: str, open_idx: int) -> Optional[int]:
+    depth = 0
+    for idx in range(open_idx, len(text)):
+        char = text[idx]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return None
+
+
+def _split_top_level_args(raw: str) -> List[str]:
+    parts: List[str] = []
+    depth = 0
+    start = 0
+    for idx, char in enumerate(raw):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth > 0:
+                depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(raw[start:idx].strip())
+            start = idx + 1
+    parts.append(raw[start:].strip())
+    return parts
+
+
+def _replace_function_calls(
+    text: str,
+    func_name: str,
+    resolver,
+) -> str:
+    needle = f"{func_name}("
+    out: List[str] = []
+    cursor = 0
+
+    while True:
+        idx = text.find(needle, cursor)
+        if idx < 0:
+            out.append(text[cursor:])
+            break
+
+        out.append(text[cursor:idx])
+        open_idx = idx + len(func_name)
+        close_idx = _find_matching_paren(text, open_idx)
+        if close_idx is None:
+            out.append(text[idx:])
+            break
+
+        args = _split_top_level_args(text[open_idx + 1 : close_idx])
+        out.append(resolver(args))
+        cursor = close_idx + 1
+
+    return "".join(out)
+
+
+def _resolve_theme_functions(raw: str) -> str:
+    updated = _replace_function_calls(
+        raw,
+        "light-dark",
+        lambda args: args[0] if args else "",
+    )
+    updated = _replace_function_calls(
+        updated,
+        "var",
+        lambda args: args[1] if len(args) > 1 else (args[0] if args else ""),
+    )
+    return updated
+
+
+def _clean_inline_css_properties(raw: str, remove_keys: Set[str]) -> str:
+    if "style=" not in raw.lower():
+        return raw
+
+    pattern = re.compile(r"""style=(["'])(.*?)\1""", re.IGNORECASE | re.DOTALL)
+
+    def repl(match: re.Match[str]) -> str:
+        quote = match.group(1)
+        css = match.group(2)
+        kept: List[str] = []
+        for token in css.split(";"):
+            decl = token.strip()
+            if not decl:
+                continue
+            if ":" not in decl:
+                kept.append(decl)
+                continue
+            key, value = decl.split(":", 1)
+            if key.strip().lower() in remove_keys:
+                continue
+            kept.append(f"{key.strip()}: {value.strip()}")
+        if not kept:
+            return ""
+        return f"style={quote}{'; '.join(kept)};{quote}"
+
+    return pattern.sub(repl, raw)
+
+
+def _normalize_html_value_for_light(raw: str) -> str:
+    updated = _resolve_theme_functions(raw)
+    updated = _clean_inline_css_properties(updated, {"background-color"})
+    return updated
+
+
+def _looks_theme_sensitive(raw: str) -> bool:
+    low = raw.lower()
+    return (
+        "light-dark(" in low
+        or "var(--ge-dark-color" in low
+        or "imagebackground=default" in low
+        or "background-color:" in low
+    )
+
+
+def _inherits_theme_defaults(cell: ET.Element, bare: Sequence[str], style_map: Dict[str, str]) -> bool:
+    if cell.get("vertex") != "1":
+        return False
+    if "edgeLabel" in bare:
+        return False
+    if "fillColor" in style_map or "strokeColor" in style_map:
+        return False
+
+    shape = (style_map.get("shape") or "").strip()
+    if not shape:
+        return False
+
+    if shape in {"image", "partialRectangle", "table", "tableRow", "text"}:
+        return False
+    if "image" in bare or "image" in style_map:
+        return False
+    return True
+
+
+def _is_text_label_shape(bare: Sequence[str], style_map: Dict[str, str]) -> bool:
+    shape = (style_map.get("shape") or "").strip().lower()
+    return shape == "text" or "text" in bare
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    tree = _read_xml(args.input)
+    records = _page_records(tree)
+    if args.json:
+        print(json.dumps(records, indent=2))
+    else:
+        _render_summary(records)
+    return 0
+
+
+def cmd_list_cells(args: argparse.Namespace) -> int:
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+    page_models = _load_page_models(diagrams)
+
+    def keep_kind(cell: ET.Element) -> bool:
+        is_vertex = cell.get("vertex") == "1"
+        is_edge = cell.get("edge") == "1"
+        if args.vertex and not args.edge:
+            return is_vertex
+        if args.edge and not args.vertex:
+            return is_edge
+        return True
+
+    rows: List[Dict[str, object]] = []
+    for page_idx, diagram in _select_pages(diagrams, args.page):
+        model, _storage = page_models[page_idx]
+        graph_root = _find_root(model)
+        page_name = diagram.get("name") or f"Page {page_idx}"
+
+        for cell in graph_root.findall("mxCell"):
+            if not keep_kind(cell):
+                continue
+
+            cid = cell.get("id") or ""
+            style = cell.get("style") or ""
+            value = cell.get("value") or ""
+
+            if args.id_contains and args.id_contains not in cid:
+                continue
+            if args.value_contains and args.value_contains not in value:
+                continue
+            if args.style_contains and any(s not in style for s in args.style_contains):
+                continue
+
+            geom = _cell_geometry(cell)
+            w = geom["width"]
+            h = geom["height"]
+
+            if args.min_width is not None and (w is None or w < args.min_width):
+                continue
+            if args.min_height is not None and (h is None or h < args.min_height):
+                continue
+            if args.max_width is not None and (w is None or w > args.max_width):
+                continue
+            if args.max_height is not None and (h is None or h > args.max_height):
+                continue
+
+            rows.append(
+                {
+                    "page": page_idx,
+                    "page_name": page_name,
+                    "id": cid,
+                    "vertex": cell.get("vertex") == "1",
+                    "edge": cell.get("edge") == "1",
+                    "parent": cell.get("parent") or "",
+                    "x": geom["x"],
+                    "y": geom["y"],
+                    "width": geom["width"],
+                    "height": geom["height"],
+                    "value": value,
+                    "style": style,
+                }
+            )
+
+    if args.limit is not None:
+        rows = rows[: args.limit]
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    header = ["page", "id", "kind", "x", "y", "w", "h", "value", "style"]
+    text_rows: List[List[str]] = []
+    for r in rows:
+        kind = "edge" if r["edge"] else "vertex" if r["vertex"] else "cell"
+        text_rows.append(
+            [
+                str(r["page"]),
+                str(r["id"]),
+                kind,
+                "" if r["x"] is None else str(int(r["x"])) if float(r["x"]).is_integer() else f"{r['x']:.2f}",
+                "" if r["y"] is None else str(int(r["y"])) if float(r["y"]).is_integer() else f"{r['y']:.2f}",
+                "" if r["width"] is None else str(int(r["width"])) if float(r["width"]).is_integer() else f"{r['width']:.2f}",
+                "" if r["height"] is None else str(int(r["height"])) if float(r["height"]).is_integer() else f"{r['height']:.2f}",
+                _truncate(str(r["value"]), 48),
+                _truncate(str(r["style"]), 72),
+            ]
+        )
+
+    widths = [len(h) for h in header]
+    for row in text_rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(row: Sequence[str]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+
+    print(fmt(header))
+    print(fmt(["-" * w for w in widths]))
+    for row in text_rows:
+        print(fmt(row))
+
+    return 0
+
+
+def cmd_convert_storage(args: argparse.Namespace) -> int:
+    _guard_output_path(args.input, args.output, args.in_place, args.force)
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+
+    changed = 0
+    for diagram in diagrams:
+        model_xml, source_storage = _extract_model_xml(diagram)
+        target_storage = source_storage if args.storage == "preserve" else args.storage
+        if target_storage != source_storage:
+            changed += 1
+        _set_diagram_model_xml(diagram, model_xml, target_storage)
+
+    backup_path = _write_with_optional_backup(tree, args.output, args.backup)
+    msg = (
+        f"converted {changed} page(s); wrote {len(diagrams)} page(s) to {args.output} "
+        f"(target storage: {args.storage})"
+    )
+    if backup_path:
+        msg += f"; backup={backup_path}"
+    print(msg)
+    return 0
+
+
+def cmd_set_cell(args: argparse.Namespace) -> int:
+    _guard_output_path(args.input, args.output, args.in_place, args.force)
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+
+    set_pairs = _parse_key_value_pairs(args.set_style, "--set-style")
+    remove_keys = args.remove_style or []
+    _ensure_change_request(args.set_value, args.append_value, set_pairs, remove_keys)
+
+    page_models = _load_page_models(diagrams)
+
+    matched = 0
+    modified = 0
+
+    for page_idx, _diagram in _select_pages(diagrams, args.page):
+        model, _storage = page_models[page_idx]
+        for cell in model.findall(".//mxCell"):
+            if cell.get("id") != args.cell_id:
+                continue
+            matched += 1
+            if _apply_cell_edit(cell, args.set_value, args.append_value, set_pairs, remove_keys):
+                modified += 1
+
+    if matched == 0:
+        page_hint = f" on page {args.page}" if args.page is not None else ""
+        _die(f"cell id '{args.cell_id}' not found{page_hint}")
+
+    _save_page_models(diagrams, page_models, args.storage)
+
+    if args.dry_run:
+        print(
+            f"dry-run: matched {matched} cell(s), would modify {modified} cell(s), "
+            f"would write {len(diagrams)} page(s) to {args.output}"
+        )
+        return 0
+
+    backup_path = _write_with_optional_backup(tree, args.output, args.backup)
+    msg = f"matched {matched} cell(s), modified {modified} cell(s), wrote {len(diagrams)} page(s) to {args.output}"
+    if backup_path:
+        msg += f"; backup={backup_path}"
+    print(msg)
+    return 0
+
+
+def cmd_set_cells(args: argparse.Namespace) -> int:
+    _guard_output_path(args.input, args.output, args.in_place, args.force)
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+
+    if not args.cell_id:
+        _die("set-cells requires at least one --cell-id")
+
+    target_ids: List[str] = []
+    seen: Set[str] = set()
+    for cid in args.cell_id:
+        if cid not in seen:
+            seen.add(cid)
+            target_ids.append(cid)
+
+    set_pairs = _parse_key_value_pairs(args.set_style, "--set-style")
+    remove_keys = args.remove_style or []
+    _ensure_change_request(args.set_value, args.append_value, set_pairs, remove_keys)
+
+    page_models = _load_page_models(diagrams)
+
+    matched = 0
+    modified = 0
+    matched_ids: Set[str] = set()
+
+    for page_idx, _diagram in _select_pages(diagrams, args.page):
+        model, _storage = page_models[page_idx]
+        for cell in model.findall(".//mxCell"):
+            cid = cell.get("id")
+            if cid not in seen:
+                continue
+            matched += 1
+            if cid is not None:
+                matched_ids.add(cid)
+            if _apply_cell_edit(cell, args.set_value, args.append_value, set_pairs, remove_keys):
+                modified += 1
+
+    missing_ids = [cid for cid in target_ids if cid not in matched_ids]
+    if missing_ids:
+        page_hint = f" on page {args.page}" if args.page is not None else ""
+        _die(f"set-cells: missing cell id(s){page_hint}: {', '.join(missing_ids)}")
+
+    _save_page_models(diagrams, page_models, args.storage)
+
+    if args.dry_run:
+        print(
+            f"dry-run: matched {matched} cell(s) across {len(target_ids)} id(s), "
+            f"would modify {modified} cell(s), would write {len(diagrams)} page(s) to {args.output}"
+        )
+        return 0
+
+    backup_path = _write_with_optional_backup(tree, args.output, args.backup)
+    msg = (
+        f"matched {matched} cell(s) across {len(target_ids)} id(s), modified {modified} cell(s), "
+        f"wrote {len(diagrams)} page(s) to {args.output}"
+    )
+    if backup_path:
+        msg += f"; backup={backup_path}"
+    print(msg)
+    return 0
+
+
+def _style_lint_findings(page_idx: int, cell: ET.Element) -> List[str]:
+    findings: List[str] = []
+    cid = cell.get("id") or "<missing-id>"
+    style = cell.get("style") or ""
+    value = cell.get("value") or ""
+    bare, style_map = _style_lookup(style)
+
+    is_edge_label = "edgeLabel" in bare
+    if is_edge_label:
+        if "labelBackgroundColor" not in style_map:
+            findings.append(
+                f"page {page_idx}: edgeLabel {cid} missing explicit labelBackgroundColor=none"
+            )
+        if "fontColor" not in style_map:
+            findings.append(
+                f"page {page_idx}: edgeLabel {cid} missing explicit fontColor and may inherit theme defaults"
+            )
+        bg = (style_map.get("labelBackgroundColor") or "").strip().lower()
+        fill = (style_map.get("fillColor") or "").strip().lower()
+        if bg and bg not in {"none", "transparent", "default"}:
+            findings.append(
+                f"page {page_idx}: edgeLabel {cid} has non-transparent labelBackgroundColor={bg}"
+            )
+        if fill and fill not in {"none", "transparent", "default"}:
+            findings.append(f"page {page_idx}: edgeLabel {cid} has fillColor={fill}; prefer fillColor=none")
+
+    font_raw = style_map.get("fontColor")
+    fill_raw = style_map.get("fillColor")
+    if fill_raw:
+        fill_l = fill_raw.strip().lower()
+        if fill_l not in {"none", "transparent", "default"}:
+            fill_rgb = _parse_hex_color(fill_l)
+            if fill_rgb is not None:
+                if font_raw:
+                    font_rgb = _parse_hex_color(font_raw)
+                    if font_rgb is not None:
+                        ratio = _contrast_ratio(fill_rgb, font_rgb)
+                        if ratio < 4.5:
+                            findings.append(
+                                f"page {page_idx}: cell {cid} low text contrast (fillColor={fill_l}, "
+                                f"fontColor={font_raw}, ratio={ratio:.2f})"
+                            )
+                else:
+                    default_black = (0, 0, 0)
+                    ratio = _contrast_ratio(fill_rgb, default_black)
+                    if ratio < 3.0:
+                        findings.append(
+                            f"page {page_idx}: cell {cid} uses dark fillColor={fill_l} without explicit fontColor"
+                        )
+
+    if _is_text_label_shape(bare, style_map) and not font_raw:
+        fill_l = (fill_raw or "").strip().lower()
+        if fill_l in {"", "none", "transparent", "default"}:
+            findings.append(
+                f"page {page_idx}: text cell {cid} has no explicit fontColor and may inherit theme defaults"
+            )
+
+    if "light-dark(" in style.lower():
+        findings.append(f"page {page_idx}: cell {cid} style contains theme-dependent light-dark(...)")
+
+    if "var(--ge-dark-color" in style.lower():
+        findings.append(f"page {page_idx}: cell {cid} style contains theme-dependent var(--ge-dark-color...)")
+
+    if style_map.get("imageBackground", "").strip().lower() == "default":
+        findings.append(f"page {page_idx}: cell {cid} uses imageBackground=default")
+
+    if _inherits_theme_defaults(cell, bare, style_map):
+        shape = style_map.get("shape") or "<unknown-shape>"
+        findings.append(
+            f"page {page_idx}: cell {cid} shape={shape} has no explicit fillColor/strokeColor and may inherit theme defaults"
+        )
+
+    value_low = value.lower()
+    if "light-dark(" in value_low:
+        findings.append(f"page {page_idx}: cell {cid} value contains theme-dependent light-dark(...)")
+    if "var(--ge-dark-color" in value_low:
+        findings.append(f"page {page_idx}: cell {cid} value contains theme-dependent var(--ge-dark-color...)")
+    if "background-color:" in value_low:
+        findings.append(
+            f"page {page_idx}: cell {cid} value contains inline background-color CSS; review for cross-platform rendering"
+        )
+
+    return findings
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+
+    findings: List[str] = []
+    style_findings: List[str] = []
+
+    for idx, diagram in enumerate(diagrams, start=1):
+        model_xml, _storage = _extract_model_xml(diagram)
+        model = _parse_model(model_xml)
+        graph_root = _find_root(model)
+        cells = graph_root.findall("mxCell")
+
+        ids: Dict[str, ET.Element] = {}
+        for cell in cells:
+            cid = cell.get("id")
+            if not cid:
+                findings.append(f"page {idx}: cell without id")
+                continue
+            if cid in ids:
+                findings.append(f"page {idx}: duplicate cell id '{cid}'")
+            else:
+                ids[cid] = cell
+
+        for cell in cells:
+            if cell.get("edge") == "1":
+                cid = cell.get("id") or "<missing-id>"
+                src = cell.get("source")
+                tgt = cell.get("target")
+                if src and src not in ids:
+                    findings.append(f"page {idx}: edge {cid} has missing source '{src}'")
+                if tgt and tgt not in ids:
+                    findings.append(f"page {idx}: edge {cid} has missing target '{tgt}'")
+
+            if args.style:
+                style_findings.extend(_style_lint_findings(idx, cell))
+
+    if findings:
+        print("invalid")
+        for finding in findings:
+            print(f"- {finding}")
+        return 2
+
+    if args.style and style_findings:
+        print("valid")
+        print("style-warnings")
+        for finding in style_findings:
+            print(f"- {finding}")
+        if args.fail_on_style:
+            return 3
+        return 0
+
+    print("valid")
+    return 0
+
+
+def _transform_theme_color(key: str, value: str, theme: str) -> str:
+    raw = value.strip()
+    low = raw.lower()
+    if low in {"none", "transparent", "default", "inherit"}:
+        return value
+
+    rgb = _parse_hex_color(raw)
+    if rgb is None:
+        return value
+
+    lum = _luminance(rgb)
+    neutral = _is_neutral(rgb)
+
+    if theme == "light":
+        if key == "fillColor" and neutral and lum < 0.45:
+            return "#ffffff"
+        if key in {"strokeColor", "fontColor"} and lum > 0.75:
+            return "#000000"
+        if key == "labelBackgroundColor" and neutral:
+            return "none"
+        return value
+
+    if key == "fillColor" and neutral and lum > 0.55:
+        return "#05070A"
+    if key in {"strokeColor", "fontColor"} and lum < 0.35:
+        return "#ffffff"
+    if key == "labelBackgroundColor" and neutral:
+        return "none"
+    return value
+
+
+def _theme_fg(theme: str) -> str:
+    return "#000000" if theme == "light" else "#ffffff"
+
+
+def _theme_bg(theme: str) -> str:
+    return "#ffffff" if theme == "light" else "#05070A"
+
+
+def cmd_apply_theme(args: argparse.Namespace) -> int:
+    _guard_output_path(args.input, args.output, args.in_place, args.force)
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+    page_models = _load_page_models(diagrams)
+
+    updates = 0
+    touched_cells = 0
+
+    for page_idx, diagram in _select_pages(diagrams, args.page):
+        model, _storage = page_models[page_idx]
+        model_bg = model.get("background")
+        target_bg = _theme_bg(args.theme)
+        if model_bg != target_bg:
+            model.set("background", target_bg)
+            updates += 1
+
+        for cell in model.findall(".//mxCell"):
+            style = cell.get("style")
+            if not style:
+                continue
+
+            bare, style_map = _style_lookup(style)
+            set_pairs: List[Tuple[str, str]] = []
+
+            for key, val in style_map.items():
+                new_val = _transform_theme_color(key, val, args.theme)
+                if new_val != val:
+                    set_pairs.append((key, new_val))
+
+            if cell.get("edge") == "1":
+                if "strokeColor" not in style_map:
+                    set_pairs.append(("strokeColor", _theme_fg(args.theme)))
+                if "endArrow" in style_map and "endFill" not in style_map:
+                    set_pairs.append(("endFill", "1"))
+
+            if "edgeLabel" in bare:
+                set_pairs.append(("labelBackgroundColor", "none"))
+                set_pairs.append(("fillColor", "none"))
+                set_pairs.append(("strokeColor", "none"))
+                if "fontColor" not in style_map:
+                    set_pairs.append(("fontColor", _theme_fg(args.theme)))
+
+            fill_after = dict(style_map)
+            for k, v in set_pairs:
+                fill_after[k] = v
+            if "fontColor" not in style_map and "fillColor" in fill_after:
+                normalized = _normalize_hex(fill_after["fillColor"]) or fill_after["fillColor"].strip().lower()
+                if normalized == _theme_bg(args.theme).lower():
+                    set_pairs.append(("fontColor", _theme_fg(args.theme)))
+
+            if not set_pairs:
+                continue
+
+            before = style
+            cell.set("style", _set_style_keys(style, set_pairs, []))
+            if cell.get("style") != before:
+                touched_cells += 1
+
+    _save_page_models(diagrams, page_models, args.storage)
+
+    if args.dry_run:
+        print(
+            f"dry-run: applied theme={args.theme} to page scope "
+            f"{'all' if args.page is None else args.page}; would modify {touched_cells} cell(s)"
+        )
+        return 0
+
+    backup_path = _write_with_optional_backup(tree, args.output, args.backup)
+    msg = (
+        f"applied theme={args.theme} to page scope {'all' if args.page is None else args.page}; "
+        f"modified {touched_cells} cell(s), updated {updates} page background attribute(s), "
+        f"wrote {len(diagrams)} page(s) to {args.output}"
+    )
+    if backup_path:
+        msg += f"; backup={backup_path}"
+    print(msg)
+    return 0
+
+
+def cmd_normalize_light(args: argparse.Namespace) -> int:
+    _guard_output_path(args.input, args.output, args.in_place, args.force)
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+    page_models = _load_page_models(diagrams)
+
+    touched_cells = 0
+    updated_pages = 0
+
+    for page_idx, _diagram in _select_pages(diagrams, args.page):
+        model, _storage = page_models[page_idx]
+        if model.get("background") != "#ffffff":
+            model.set("background", "#ffffff")
+            updated_pages += 1
+
+        for cell in model.findall(".//mxCell"):
+            cell_changed = False
+            style = cell.get("style") or ""
+            if style:
+                bare, style_map = _style_lookup(style)
+                set_pairs: List[Tuple[str, str]] = []
+
+                for key, value in style_map.items():
+                    normalized = _resolve_theme_functions(value)
+                    if normalized != value:
+                        set_pairs.append((key, normalized))
+
+                if style_map.get("imageBackground", "").strip().lower() == "default":
+                    set_pairs.append(("imageBackground", "none"))
+
+                if "edgeLabel" in bare:
+                    set_pairs.append(("labelBackgroundColor", "none"))
+                    set_pairs.append(("fillColor", "none"))
+                    set_pairs.append(("strokeColor", "none"))
+                    if "fontColor" not in style_map:
+                        set_pairs.append(("fontColor", "#000000"))
+                elif _is_text_label_shape(bare, style_map) and "fontColor" not in style_map:
+                    fill_l = (style_map.get("fillColor") or "").strip().lower()
+                    if fill_l in {"", "none", "transparent", "default"}:
+                        set_pairs.append(("fontColor", "#000000"))
+
+                if set_pairs:
+                    before = style
+                    cell.set("style", _set_style_keys(style, set_pairs, []))
+                    cell_changed = cell.get("style") != before
+
+            value = cell.get("value") or ""
+            if value and _looks_theme_sensitive(value):
+                normalized_value = _normalize_html_value_for_light(value)
+                if normalized_value != value:
+                    cell.set("value", normalized_value)
+                    cell_changed = True
+
+            if cell_changed:
+                touched_cells += 1
+
+    _save_page_models(diagrams, page_models, args.storage)
+
+    if args.dry_run:
+        print(
+            f"dry-run: normalized light-mode compatibility for page scope "
+            f"{'all' if args.page is None else args.page}; would modify {touched_cells} cell(s), "
+            f"would update {updated_pages} page background attribute(s)"
+        )
+        return 0
+
+    backup_path = _write_with_optional_backup(tree, args.output, args.backup)
+    msg = (
+        f"normalized light-mode compatibility for page scope {'all' if args.page is None else args.page}; "
+        f"modified {touched_cells} cell(s), updated {updated_pages} page background attribute(s), "
+        f"wrote {len(diagrams)} page(s) to {args.output}"
+    )
+    if backup_path:
+        msg += f"; backup={backup_path}"
+    print(msg)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Read and edit draw.io diagram files")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_summary = sub.add_parser("summary", help="Show page-level structure and counts")
+    p_summary.add_argument("input", help="Input .drawio/.xml file")
+    p_summary.add_argument("--json", action="store_true", help="Output JSON")
+    p_summary.set_defaults(func=cmd_summary)
+
+    p_list = sub.add_parser("list-cells", help="List cells with optional filters")
+    p_list.add_argument("input", help="Input .drawio/.xml file")
+    p_list.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_list.add_argument("--vertex", action="store_true", help="Include only vertex cells")
+    p_list.add_argument("--edge", action="store_true", help="Include only edge cells")
+    p_list.add_argument("--id-contains", help="Filter cells whose id contains this substring")
+    p_list.add_argument("--value-contains", help="Filter cells whose @value contains this substring")
+    p_list.add_argument(
+        "--style-contains",
+        action="append",
+        help="Require style string to contain this substring (repeatable)",
+    )
+    p_list.add_argument("--min-width", type=float, help="Keep cells with width >= value")
+    p_list.add_argument("--min-height", type=float, help="Keep cells with height >= value")
+    p_list.add_argument("--max-width", type=float, help="Keep cells with width <= value")
+    p_list.add_argument("--max-height", type=float, help="Keep cells with height <= value")
+    p_list.add_argument("--limit", type=int, help="Limit output rows")
+    p_list.add_argument("--json", action="store_true", help="Output JSON")
+    p_list.set_defaults(func=cmd_list_cells)
+
+    p_validate = sub.add_parser("validate", help="Validate page decodability, references, and style/theme risks")
+    p_validate.add_argument("input", help="Input .drawio/.xml file")
+    p_validate.add_argument(
+        "--style",
+        action="store_true",
+        help="Also run style lint checks (contrast, edge label backgrounds, and theme-compatibility risks)",
+    )
+    p_validate.add_argument(
+        "--fail-on-style",
+        action="store_true",
+        help="Return non-zero when style warnings are present (requires --style)",
+    )
+    p_validate.set_defaults(func=cmd_validate)
+
+    p_convert = sub.add_parser("convert-storage", help="Convert pages between compressed/uncompressed storage")
+    p_convert.add_argument("input", help="Input .drawio/.xml file")
+    p_convert.add_argument("output", help="Output file")
+    p_convert.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Allow writing to the same path as input",
+    )
+    p_convert.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output file",
+    )
+    p_convert.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a timestamped backup of the output path before writing",
+    )
+    p_convert.add_argument(
+        "--storage",
+        choices=["preserve", "compressed", "uncompressed"],
+        default="preserve",
+        help="Target page storage mode",
+    )
+    p_convert.set_defaults(func=cmd_convert_storage)
+
+    p_set = sub.add_parser("set-cell", help="Edit one cell by id (value and/or style keys)")
+    p_set.add_argument("input", help="Input .drawio/.xml file")
+    p_set.add_argument("output", help="Output file")
+    p_set.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Allow writing to the same path as input",
+    )
+    p_set.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output file",
+    )
+    p_set.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a timestamped backup of the output path before writing",
+    )
+    p_set.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and report changes without writing output",
+    )
+    p_set.add_argument("--cell-id", required=True, help="mxCell id to edit")
+    p_set.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_set.add_argument("--set-value", help="Replace cell @value")
+    p_set.add_argument("--append-value", help="Append text to cell @value")
+    p_set.add_argument(
+        "--set-style",
+        action="append",
+        help="Style key=value to set or update (repeatable)",
+    )
+    p_set.add_argument(
+        "--remove-style",
+        action="append",
+        help="Style key to remove (repeatable)",
+    )
+    p_set.add_argument(
+        "--storage",
+        choices=["preserve", "compressed", "uncompressed"],
+        default="preserve",
+        help="Output page storage mode",
+    )
+    p_set.set_defaults(func=cmd_set_cell)
+
+    p_set_multi = sub.add_parser("set-cells", help="Batch edit multiple cells by id")
+    p_set_multi.add_argument("input", help="Input .drawio/.xml file")
+    p_set_multi.add_argument("output", help="Output file")
+    p_set_multi.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Allow writing to the same path as input",
+    )
+    p_set_multi.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output file",
+    )
+    p_set_multi.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a timestamped backup of the output path before writing",
+    )
+    p_set_multi.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and report changes without writing output",
+    )
+    p_set_multi.add_argument(
+        "--cell-id",
+        action="append",
+        required=True,
+        help="mxCell id to edit (repeatable)",
+    )
+    p_set_multi.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_set_multi.add_argument("--set-value", help="Replace cell @value")
+    p_set_multi.add_argument("--append-value", help="Append text to cell @value")
+    p_set_multi.add_argument(
+        "--set-style",
+        action="append",
+        help="Style key=value to set or update (repeatable)",
+    )
+    p_set_multi.add_argument(
+        "--remove-style",
+        action="append",
+        help="Style key to remove (repeatable)",
+    )
+    p_set_multi.add_argument(
+        "--storage",
+        choices=["preserve", "compressed", "uncompressed"],
+        default="preserve",
+        help="Output page storage mode",
+    )
+    p_set_multi.set_defaults(func=cmd_set_cells)
+
+    p_theme = sub.add_parser("apply-theme", help="Apply a light/dark neutral style transform")
+    p_theme.add_argument("input", help="Input .drawio/.xml file")
+    p_theme.add_argument("output", help="Output file")
+    p_theme.add_argument(
+        "--theme",
+        choices=["light", "dark"],
+        required=True,
+        help="Theme to apply",
+    )
+    p_theme.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_theme.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Allow writing to the same path as input",
+    )
+    p_theme.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output file",
+    )
+    p_theme.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a timestamped backup of the output path before writing",
+    )
+    p_theme.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and report changes without writing output",
+    )
+    p_theme.add_argument(
+        "--storage",
+        choices=["preserve", "compressed", "uncompressed"],
+        default="preserve",
+        help="Output page storage mode",
+    )
+    p_theme.set_defaults(func=cmd_apply_theme)
+
+    p_normalize = sub.add_parser(
+        "normalize-light",
+        help="Normalize theme-sensitive content for light-mode and cross-platform rendering",
+    )
+    p_normalize.add_argument("input", help="Input .drawio/.xml file")
+    p_normalize.add_argument("output", help="Output file")
+    p_normalize.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_normalize.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Allow writing to the same path as input",
+    )
+    p_normalize.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output file",
+    )
+    p_normalize.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a timestamped backup of the output path before writing",
+    )
+    p_normalize.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and report changes without writing output",
+    )
+    p_normalize.add_argument(
+        "--storage",
+        choices=["preserve", "compressed", "uncompressed"],
+        default="preserve",
+        help="Output page storage mode",
+    )
+    p_normalize.set_defaults(func=cmd_normalize_light)
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "fail_on_style", False) and not getattr(args, "style", False):
+        _die("--fail-on-style requires --style")
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
