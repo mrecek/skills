@@ -1,29 +1,34 @@
 ---
 name: drawio-diagrams
-description: Read, validate, and edit draw.io diagrams (.drawio) at the XML level — page summaries, filtered cell discovery, targeted edits by mxCell id, batch style updates, theme normalization, and storage conversion.
+description: Read, validate, and edit draw.io diagrams (.drawio) at the XML level — page summaries, filtered cell discovery, geometry measurement, alignment, distribution, targeted edits by mxCell id, batch style updates, theme normalization, and storage conversion.
 ---
 
 # Drawio Diagrams
 
 ## Overview
 
-Use this skill to safely automate draw.io diagram work without relying on manual GUI edits. Use bundled commands for page summaries, filtered cell discovery, validation, theme transforms, storage conversion, and targeted/batch cell edits.
+Use this skill to safely automate draw.io diagram work without relying on manual GUI edits. Use bundled commands for page summaries, filtered cell discovery, geometry measurement, alignment, distribution, validation, theme transforms, storage conversion, and targeted/batch cell edits.
 
 Use this skill especially when a diagram renders differently across platforms (for example Windows vs Mac) or when dark-mode/theme defaults introduce unexpected backgrounds, icon fills, or label boxes.
 
 ## Quick start
 
 1. Inspect structure first.
-2. Scan for theme-sensitive tokens before editing.
-3. Discover candidate cells with filtered `list-cells`.
-4. Edit into a new output file (or in-place + `--backup`).
-5. Validate structure and style.
-6. Convert storage mode only when needed.
+2. Identify the real visual anchor before editing.
+3. Scan for theme-sensitive tokens before editing.
+4. Discover candidate cells with filtered `list-cells`.
+5. Measure geometry before layout changes.
+6. Edit into a new output file (or in-place + `--backup`).
+7. Validate structure and style.
+8. Convert storage mode only when needed.
 
 ```bash
 python3 script summary <file.drawio>
+python3 script measure <file.drawio> --page 1 --cell-id container-id --cell-id child-id
 rg -n "light-dark|imageBackground=default|var\\(--ge-dark-color|background-color:" <file.drawio>
 python3 script list-cells <file.drawio> --page 1 --vertex --min-width 400
+python3 script align <file.drawio> out.drawio --page 1 --cell-id child-id --axis center-x --to-cell container-id
+python3 script distribute <file.drawio> out.drawio --page 1 --cell-id id-1 --cell-id id-2 --cell-id id-3 --axis vertical
 python3 script validate <file.drawio> --style
 ```
 
@@ -32,11 +37,12 @@ python3 script validate <file.drawio> --style
 1. Run `summary` to identify page names, storage mode, and cell counts.
 2. Scan the file for theme-sensitive tokens with `rg` and targeted `list-cells` queries before editing.
 3. Run `list-cells` to find target ids by page/type/style/geometry.
-4. Apply targeted changes with `set-cell` or batch changes with `set-cells`.
-5. If the issue is cross-platform or light/dark rendering drift, run `normalize-light` before manual cleanups.
-6. For large neutral-color shifts, use `apply-theme --theme light|dark`.
-7. Run `validate --style` on the edited output.
-8. Optionally run `convert-storage` if the output must be all compressed or all uncompressed.
+4. Run `measure` when the task depends on centers, edges, or spacing.
+5. Apply targeted changes with `set-cell`, batch changes with `set-cells`, `align` for shared centers/edges, or `distribute` for equal spacing.
+6. If the issue is cross-platform or light/dark rendering drift, run `normalize-light` before manual cleanups.
+7. For large neutral-color shifts, use `apply-theme --theme light|dark`.
+8. Run `validate --style` on the edited output.
+9. Optionally run `convert-storage` if the output must be all compressed or all uncompressed.
 
 ## Commands
 
@@ -57,6 +63,24 @@ List cells with optional filters so edits can be scoped precisely.
 python3 script list-cells diagram.drawio --page 5 --vertex --min-width 500
 python3 script list-cells diagram.drawio --style-contains fillColor=#000000 --json
 python3 script list-cells diagram.drawio --edge --value-contains "Metrics"
+```
+
+When `--json` is used, output includes geometry fields that are useful for layout work:
+
+- `x`, `y`, `width`, `height`
+- `left`, `top`, `right`, `bottom`
+- `center_x`, `center_y`
+- `geometry` object duplicating those values for easier downstream scripting
+
+### `measure`
+
+Show geometry metrics for one or more selected cells.
+
+Use this when you need exact centers, edges, or to verify whether a cell is centered to a container or only to a nearby label.
+
+```bash
+python3 script measure diagram.drawio --page 4 --cell-id container-id --cell-id child-id
+python3 script measure diagram.drawio --cell-id id-1 --cell-id id-2 --json
 ```
 
 ### `validate`
@@ -111,7 +135,14 @@ python3 script set-cell in.drawio in.drawio \
   --cell-id k_x_UaeQuVGz606EVGA7-25 \
   --set-style fillColor=#ffffff \
   --in-place --backup
+
+python3 script set-cell in.drawio out.drawio \
+  --cell-id child-id \
+  --set-geom x=120 \
+  --set-geom width=320
 ```
+
+`--set-geom` supports absolute geometry updates for `x`, `y`, `width`, and `height`.
 
 ### `set-cells`
 
@@ -127,7 +158,69 @@ python3 script set-cells in.drawio in.drawio \
   --cell-id id-1 --cell-id id-2 \
   --set-style strokeColor=#000000 \
   --in-place --backup
+
+python3 script set-cells in.drawio out.drawio \
+  --cell-id id-1 --cell-id id-2 \
+  --set-geom width=260
 ```
+
+### `align`
+
+Align one or more absolute-position cells to a reference cell or to each cell's parent.
+
+Use this when the change is fundamentally “make these share the same center or edge.”
+
+```bash
+python3 script align in.drawio out.drawio \
+  --page 4 \
+  --cell-id label-id \
+  --axis center-x \
+  --to-cell container-id
+
+python3 script align in.drawio out.drawio \
+  --page 4 \
+  --cell-id id-1 --cell-id id-2 \
+  --axis center-x \
+  --to-cell container-id
+
+python3 script align in.drawio out.drawio \
+  --page 4 \
+  --cell-id child-id \
+  --axis center-y \
+  --to-parent
+```
+
+Notes:
+
+- `align` currently supports absolute-position cells only; it refuses relative-geometry cells such as many edge labels.
+- Use `--offset` when you want alignment plus a deliberate nudge on the affected axis.
+
+### `distribute`
+
+Distribute absolute-position cells evenly between the outermost cells on a horizontal or vertical axis.
+
+Use this when the change is fundamentally “make the spacing even” rather than “make these line up.”
+
+```bash
+python3 script distribute in.drawio out.drawio \
+  --page 4 \
+  --cell-id id-1 --cell-id id-2 --cell-id id-3 --cell-id id-4 \
+  --axis vertical
+
+python3 script distribute in.drawio out.drawio \
+  --page 4 \
+  --cell-id id-1 --cell-id id-2 --cell-id id-3 --cell-id id-4 \
+  --axis horizontal \
+  --mode center
+```
+
+Notes:
+
+- `distribute` requires at least 3 cells.
+- It keeps the outermost cells fixed and moves interior cells only.
+- `--mode gap` makes edge-to-edge gaps equal.
+- `--mode center` makes center-to-center spacing equal.
+- `distribute` currently supports absolute-position cells only; it refuses relative-geometry cells such as many edge labels.
 
 ### `apply-theme`
 
@@ -172,6 +265,8 @@ python3 script convert-storage in.drawio in.drawio --storage compressed --in-pla
 ## Editing rules
 
 - Prefer targeted edits by `mxCell@id`.
+- Prefer measuring before making layout changes that depend on center, edge, or spacing.
+- Prefer explicit geometry edits (`measure`, `align`, `distribute`, `--set-geom`) over hand-calculating in raw XML when the tool can do it for you.
 - Scan for `light-dark`, `imageBackground=default`, `var(--ge-dark-color`, and inline `background-color:` before visual edits.
 - Avoid broad search/replace on full XML.
 - Prefer writing to a new output path; if editing in-place, use `--backup`.
@@ -181,6 +276,47 @@ python3 script convert-storage in.drawio in.drawio --storage compressed --in-pla
 - Validate after each edit batch (`validate --style` for visual changes).
 - When labels use HTML in `@value`, inspect and edit both the style string and the HTML payload; visual bugs often live in the HTML, not only in `style=...`.
 
+## Layout Workflow
+
+Use this workflow for spacing, centering, alignment, and other layout changes:
+
+1. Identify the true visual anchor first.
+2. Prefer the containing shape or region over a nearby caption.
+3. Use `measure` or `list-cells --json` to confirm geometry before moving anything.
+4. For width/height changes, re-check the center after resizing.
+5. Use `align` when the change is “make this share the same center or edge as that.”
+6. Use `distribute` when the change is “make the spacing between these even.”
+7. Use `--set-geom` when you need explicit coordinates or dimensions.
+8. Re-measure after the edit to verify the math instead of trusting the eye alone.
+
+Anchor-selection guidance:
+
+- Container first: the visual region that defines the layout
+- Group second: a structural wrapper or repeated column/row
+- Label last: only when the label itself is the intended anchor
+
+Edge-label guidance:
+
+- Treat attachment point, label offset from the line, and label position along the line as separate concerns.
+- “Centered to the line” can mean horizontally centered, vertically centered, or both; be explicit.
+- Preserve deliberate side offsets unless the user asks to remove them.
+
+## Geometry Math
+
+Useful formulas for layout work:
+
+- `center_x = x + width / 2`
+- `center_y = y + height / 2`
+- To center cell `B` inside reference `A` on the x-axis: `B.x = A.center_x - B.width / 2`
+- To center cell `B` inside reference `A` on the y-axis: `B.y = A.center_y - B.height / 2`
+- To right-align `B` to `A`: `B.x = A.right - B.width`
+- To bottom-align `B` to `A`: `B.y = A.bottom - B.height`
+
+Notes:
+
+- Odd-sized containers can produce half-unit centers; that is normal.
+- If a result is off by `0.5`, check whether the reference width or height is odd before assuming the math is wrong.
+
 ## Visual Refactor Checklist
 
 Use this checklist for broad style changes (background/theme/contrast updates):
@@ -189,13 +325,16 @@ Use this checklist for broad style changes (background/theme/contrast updates):
 2. Scan for theme-sensitive tokens with `rg` and `list-cells`:
    `light-dark`, `imageBackground=default`, `var(--ge-dark-color`, `background-color:`
 3. Locate candidate containers via `list-cells` geometry filters (`--min-width`, `--min-height`).
-4. Locate dependent labels/arrows via `list-cells` filters (`--edge`, `--style-contains`, `--value-contains`).
-5. If the issue is broad light-mode drift, run `normalize-light --dry-run` first.
-6. Run edits in one batch (`set-cells`) where possible; avoid many single writes.
-7. Use `--dry-run` first.
-8. If in-place, enable `--backup`.
-9. Run `validate --style`.
-10. Re-open diagram and visually verify target page(s).
+4. Measure likely anchors and dependents before editing layout.
+5. Locate dependent labels/arrows via `list-cells` filters (`--edge`, `--style-contains`, `--value-contains`).
+6. Use `align`, `distribute`, or `--set-geom` for coordinate changes instead of raw XML patching when possible.
+7. Re-measure after layout edits to confirm actual centers, edges, and gaps.
+8. If the issue is broad light-mode drift, run `normalize-light --dry-run` first.
+9. Run edits in one batch (`set-cells`) where possible; avoid many single writes.
+10. Use `--dry-run` first.
+11. If in-place, enable `--backup`.
+12. Run `validate --style`.
+13. Re-open diagram and visually verify target page(s).
 
 ## Theme Compatibility
 

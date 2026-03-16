@@ -307,6 +307,7 @@ def _apply_cell_edit(
     append_value: Optional[str],
     set_pairs: Sequence[Tuple[str, str]],
     remove_keys: Sequence[str],
+    set_geom_pairs: Sequence[Tuple[str, str]],
 ) -> bool:
     before = ET.tostring(cell, encoding="unicode")
 
@@ -320,6 +321,12 @@ def _apply_cell_edit(
         style = cell.get("style") or ""
         cell.set("style", _set_style_keys(style, set_pairs, remove_keys))
 
+    if set_geom_pairs:
+        geom = _geometry_element(cell, create=True)
+        assert geom is not None
+        for key, value in set_geom_pairs:
+            geom.set(key, value)
+
     after = ET.tostring(cell, encoding="unicode")
     return before != after
 
@@ -329,9 +336,13 @@ def _ensure_change_request(
     append_value: Optional[str],
     set_pairs: Sequence[Tuple[str, str]],
     remove_keys: Sequence[str],
+    set_geom_pairs: Sequence[Tuple[str, str]],
 ) -> None:
-    if set_value is None and append_value is None and not set_pairs and not remove_keys:
-        _die("no cell changes requested; provide --set-value, --append-value, --set-style, or --remove-style")
+    if set_value is None and append_value is None and not set_pairs and not remove_keys and not set_geom_pairs:
+        _die(
+            "no cell changes requested; provide --set-value, --append-value, "
+            "--set-style, --remove-style, or --set-geom"
+        )
 
 
 def _write_with_optional_backup(
@@ -412,6 +423,154 @@ def _cell_geometry(cell: ET.Element) -> Dict[str, Optional[float]]:
         except ValueError:
             out[key] = None
     return out
+
+
+def _cell_metrics(cell: ET.Element) -> Dict[str, Optional[float]]:
+    geom = _cell_geometry(cell)
+    x = geom["x"]
+    y = geom["y"]
+    width = geom["width"]
+    height = geom["height"]
+    right = None if x is None or width is None else x + width
+    bottom = None if y is None or height is None else y + height
+    center_x = None if x is None or width is None else x + (width / 2.0)
+    center_y = None if y is None or height is None else y + (height / 2.0)
+    return {
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "left": x,
+        "top": y,
+        "right": right,
+        "bottom": bottom,
+        "center_x": center_x,
+        "center_y": center_y,
+    }
+
+
+def _fmt_num(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.2f}"
+
+
+def _geometry_element(cell: ET.Element, create: bool = False) -> Optional[ET.Element]:
+    geom = cell.find("mxGeometry")
+    if geom is None and create:
+        geom = ET.SubElement(cell, "mxGeometry")
+        geom.set("as", "geometry")
+    return geom
+
+
+def _parse_geometry_pairs(values: Optional[Sequence[str]], label: str) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    allowed = {"x", "y", "width", "height"}
+    if not values:
+        return pairs
+
+    for raw in values:
+        if "=" not in raw:
+            _die(f"{label} entry must be key=value, got: {raw}")
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key not in allowed:
+            _die(f"{label} key must be one of {', '.join(sorted(allowed))}, got: {key}")
+        try:
+            float(value)
+        except ValueError:
+            _die(f"{label} value for {key} must be numeric, got: {value}")
+        pairs.append((key, value))
+    return pairs
+
+
+def _find_cells_by_ids(
+    diagrams: Sequence[ET.Element],
+    page_models: Dict[int, Tuple[ET.Element, str]],
+    page: Optional[int],
+    target_ids: Sequence[str],
+) -> Dict[str, Tuple[int, ET.Element]]:
+    unique_ids: List[str] = []
+    seen: Set[str] = set()
+    for cid in target_ids:
+        if cid not in seen:
+            seen.add(cid)
+            unique_ids.append(cid)
+
+    matches: Dict[str, List[Tuple[int, ET.Element]]] = {cid: [] for cid in unique_ids}
+    selected_pages = _select_pages(diagrams, page)
+
+    for page_idx, _diagram in selected_pages:
+        model, _storage = page_models[page_idx]
+        for cell in model.findall(".//mxCell"):
+            cid = cell.get("id")
+            if cid in matches:
+                matches[cid].append((page_idx, cell))
+
+    out: Dict[str, Tuple[int, ET.Element]] = {}
+    page_hint = f" on page {page}" if page is not None else ""
+    missing = [cid for cid, found in matches.items() if not found]
+    if missing:
+        _die(f"missing cell id(s){page_hint}: {', '.join(missing)}")
+
+    duplicates = [cid for cid, found in matches.items() if len(found) > 1]
+    if duplicates:
+        _die(
+            "cell id(s) matched more than once across selected pages; narrow with --page: "
+            + ", ".join(duplicates)
+        )
+
+    for cid, found in matches.items():
+        out[cid] = found[0]
+    return out
+
+
+def _apply_geometry_edit(cell: ET.Element, set_pairs: Sequence[Tuple[str, str]]) -> bool:
+    if not set_pairs:
+        return False
+    before = ET.tostring(cell, encoding="unicode")
+    geom = _geometry_element(cell, create=True)
+    assert geom is not None
+    for key, value in set_pairs:
+        geom.set(key, value)
+    after = ET.tostring(cell, encoding="unicode")
+    return before != after
+
+
+def _coerce_axis_coordinate(axis: str, ref: Dict[str, Optional[float]], target: Dict[str, Optional[float]]) -> float:
+    if axis == "left":
+        if ref["left"] is None:
+            _die("reference cell is missing x geometry required for axis=left")
+        return float(ref["left"])
+    if axis == "right":
+        if ref["right"] is None or target["width"] is None:
+            _die("reference right edge or target width is missing geometry required for axis=right")
+        return float(ref["right"] - target["width"])
+    if axis == "center-x":
+        if ref["center_x"] is None or target["width"] is None:
+            _die("reference center_x or target width is missing geometry required for axis=center-x")
+        return float(ref["center_x"] - (target["width"] / 2.0))
+    if axis == "top":
+        if ref["top"] is None:
+            _die("reference cell is missing y geometry required for axis=top")
+        return float(ref["top"])
+    if axis == "bottom":
+        if ref["bottom"] is None or target["height"] is None:
+            _die("reference bottom edge or target height is missing geometry required for axis=bottom")
+        return float(ref["bottom"] - target["height"])
+    if axis == "center-y":
+        if ref["center_y"] is None or target["height"] is None:
+            _die("reference center_y or target height is missing geometry required for axis=center-y")
+        return float(ref["center_y"] - (target["height"] / 2.0))
+    _die(f"unsupported axis: {axis}")
+    raise AssertionError("unreachable")
+
+
+def _format_coordinate(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.2f}"
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -609,6 +768,7 @@ def cmd_list_cells(args: argparse.Namespace) -> int:
                 continue
 
             geom = _cell_geometry(cell)
+            metrics = _cell_metrics(cell)
             w = geom["width"]
             h = geom["height"]
 
@@ -633,6 +793,13 @@ def cmd_list_cells(args: argparse.Namespace) -> int:
                     "y": geom["y"],
                     "width": geom["width"],
                     "height": geom["height"],
+                    "left": metrics["left"],
+                    "top": metrics["top"],
+                    "right": metrics["right"],
+                    "bottom": metrics["bottom"],
+                    "center_x": metrics["center_x"],
+                    "center_y": metrics["center_y"],
+                    "geometry": metrics,
                     "value": value,
                     "style": style,
                 }
@@ -654,10 +821,10 @@ def cmd_list_cells(args: argparse.Namespace) -> int:
                 str(r["page"]),
                 str(r["id"]),
                 kind,
-                "" if r["x"] is None else str(int(r["x"])) if float(r["x"]).is_integer() else f"{r['x']:.2f}",
-                "" if r["y"] is None else str(int(r["y"])) if float(r["y"]).is_integer() else f"{r['y']:.2f}",
-                "" if r["width"] is None else str(int(r["width"])) if float(r["width"]).is_integer() else f"{r['width']:.2f}",
-                "" if r["height"] is None else str(int(r["height"])) if float(r["height"]).is_integer() else f"{r['height']:.2f}",
+                _fmt_num(r["x"]),
+                _fmt_num(r["y"]),
+                _fmt_num(r["width"]),
+                _fmt_num(r["height"]),
                 _truncate(str(r["value"]), 48),
                 _truncate(str(r["style"]), 72),
             ]
@@ -676,6 +843,292 @@ def cmd_list_cells(args: argparse.Namespace) -> int:
     for row in text_rows:
         print(fmt(row))
 
+    return 0
+
+
+def cmd_measure(args: argparse.Namespace) -> int:
+    if not args.cell_id:
+        _die("measure requires at least one --cell-id")
+
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+    page_models = _load_page_models(diagrams)
+    matched = _find_cells_by_ids(diagrams, page_models, args.page, args.cell_id)
+
+    rows: List[Dict[str, object]] = []
+    for cid in args.cell_id:
+        if cid not in matched:
+            continue
+        page_idx, cell = matched[cid]
+        rows.append(
+            {
+                "page": page_idx,
+                "id": cid,
+                "parent": cell.get("parent") or "",
+                "metrics": _cell_metrics(cell),
+                "value": cell.get("value") or "",
+            }
+        )
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    header = ["page", "id", "x", "y", "w", "h", "cx", "cy", "right", "bottom", "parent", "value"]
+    text_rows: List[List[str]] = []
+    for row in rows:
+        metrics = row["metrics"]
+        assert isinstance(metrics, dict)
+        text_rows.append(
+            [
+                str(row["page"]),
+                str(row["id"]),
+                _fmt_num(metrics["x"]),
+                _fmt_num(metrics["y"]),
+                _fmt_num(metrics["width"]),
+                _fmt_num(metrics["height"]),
+                _fmt_num(metrics["center_x"]),
+                _fmt_num(metrics["center_y"]),
+                _fmt_num(metrics["right"]),
+                _fmt_num(metrics["bottom"]),
+                str(row["parent"]),
+                _truncate(str(row["value"]), 48),
+            ]
+        )
+
+    widths = [len(h) for h in header]
+    for row in text_rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(row: Sequence[str]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+
+    print(fmt(header))
+    print(fmt(["-" * w for w in widths]))
+    for row in text_rows:
+        print(fmt(row))
+    return 0
+
+
+def cmd_align(args: argparse.Namespace) -> int:
+    _guard_output_path(args.input, args.output, args.in_place, args.force)
+    if not args.cell_id:
+        _die("align requires at least one --cell-id")
+
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+    page_models = _load_page_models(diagrams)
+
+    target_ids: List[str] = []
+    seen: Set[str] = set()
+    for cid in args.cell_id:
+        if cid not in seen:
+            seen.add(cid)
+            target_ids.append(cid)
+
+    targets = _find_cells_by_ids(diagrams, page_models, args.page, target_ids)
+
+    reference_cells: Dict[str, Dict[str, Optional[float]]] = {}
+    if args.to_cell:
+        ref_match = _find_cells_by_ids(diagrams, page_models, args.page, [args.to_cell])
+        ref_page, ref_cell = ref_match[args.to_cell]
+        ref_metrics = _cell_metrics(ref_cell)
+        for cid in target_ids:
+            target_page, _target_cell = targets[cid]
+            if target_page != ref_page:
+                _die("align reference and target cells must be on the same page")
+            reference_cells[cid] = ref_metrics
+    else:
+        for cid in target_ids:
+            page_idx, cell = targets[cid]
+            parent_id = cell.get("parent")
+            if not parent_id:
+                _die(f"cell {cid} has no parent; cannot use --to-parent")
+            model, _storage = page_models[page_idx]
+            parent = model.find(f".//mxCell[@id='{parent_id}']")
+            if parent is None:
+                _die(f"parent cell {parent_id} for {cid} was not found on page {page_idx}")
+            reference_cells[cid] = _cell_metrics(parent)
+
+    modified = 0
+    changes: List[str] = []
+    target_attr = "x" if args.axis in {"left", "right", "center-x"} else "y"
+
+    for cid in target_ids:
+        _page_idx, cell = targets[cid]
+        geom = _geometry_element(cell)
+        if geom is None:
+            _die(f"cell {cid} has no mxGeometry; cannot align")
+        if geom.get("relative") == "1":
+            _die(f"cell {cid} uses relative geometry; align currently supports absolute-position cells only")
+
+        target_metrics = _cell_metrics(cell)
+        reference_metrics = reference_cells[cid]
+        new_value = _coerce_axis_coordinate(args.axis, reference_metrics, target_metrics) + args.offset
+        new_raw = _format_coordinate(new_value)
+        old_raw = geom.get(target_attr)
+        old_num = None if old_raw is None else float(old_raw)
+
+        if old_num is None or abs(old_num - new_value) > 1e-9:
+            if _apply_geometry_edit(cell, [(target_attr, new_raw)]):
+                modified += 1
+                changes.append(f"{cid}: {target_attr} {old_raw if old_raw is not None else '<unset>'} -> {new_raw}")
+
+    _save_page_models(diagrams, page_models, args.storage)
+
+    if args.dry_run:
+        print(
+            f"dry-run: aligned {len(target_ids)} cell(s) on axis={args.axis} "
+            f"to {'cell ' + args.to_cell if args.to_cell else 'each cell parent'}; "
+            f"would modify {modified} cell(s)"
+        )
+        for change in changes[:20]:
+            print(f"- {change}")
+        return 0
+
+    backup_path = _write_with_optional_backup(tree, args.output, args.backup)
+    msg = (
+        f"aligned {len(target_ids)} cell(s) on axis={args.axis} "
+        f"to {'cell ' + args.to_cell if args.to_cell else 'each cell parent'}; "
+        f"modified {modified} cell(s), wrote {len(diagrams)} page(s) to {args.output}"
+    )
+    if backup_path:
+        msg += f"; backup={backup_path}"
+    print(msg)
+    return 0
+
+
+def cmd_distribute(args: argparse.Namespace) -> int:
+    _guard_output_path(args.input, args.output, args.in_place, args.force)
+    if not args.cell_id:
+        _die("distribute requires at least one --cell-id")
+
+    target_ids: List[str] = []
+    seen: Set[str] = set()
+    for cid in args.cell_id:
+        if cid not in seen:
+            seen.add(cid)
+            target_ids.append(cid)
+
+    if len(target_ids) < 3:
+        _die("distribute requires at least 3 unique --cell-id values")
+
+    tree = _read_xml(args.input)
+    root = tree.getroot()
+    diagrams = _get_diagrams(root)
+    page_models = _load_page_models(diagrams)
+    targets = _find_cells_by_ids(diagrams, page_models, args.page, target_ids)
+
+    ordered: List[Tuple[str, ET.Element, Dict[str, Optional[float]]]] = []
+    sort_key_name = "left" if args.axis == "horizontal" else "top"
+    if args.mode == "center":
+        sort_key_name = "center_x" if args.axis == "horizontal" else "center_y"
+
+    for cid in target_ids:
+        _page_idx, cell = targets[cid]
+        geom = _geometry_element(cell)
+        if geom is None:
+            _die(f"cell {cid} has no mxGeometry; cannot distribute")
+        if geom.get("relative") == "1":
+            _die(f"cell {cid} uses relative geometry; distribute currently supports absolute-position cells only")
+
+        metrics = _cell_metrics(cell)
+        required = ["x", "width"] if args.axis == "horizontal" else ["y", "height"]
+        for key in required:
+            if metrics[key] is None:
+                _die(f"cell {cid} is missing geometry required for axis={args.axis}: {key}")
+        if metrics[sort_key_name] is None:
+            _die(f"cell {cid} is missing geometry required for sorting: {sort_key_name}")
+        ordered.append((cid, cell, metrics))
+
+    ordered.sort(key=lambda item: float(item[2][sort_key_name]))  # type: ignore[arg-type]
+
+    modified = 0
+    changes: List[str] = []
+
+    if args.axis == "horizontal":
+        attr = "x"
+        size_key = "width"
+        start_edge_key = "left"
+        end_edge_key = "right"
+        center_key = "center_x"
+    else:
+        attr = "y"
+        size_key = "height"
+        start_edge_key = "top"
+        end_edge_key = "bottom"
+        center_key = "center_y"
+
+    if args.mode == "gap":
+        start = ordered[0][2][start_edge_key]
+        end = ordered[-1][2][end_edge_key]
+        if start is None or end is None:
+            _die("cannot compute distribution span; boundary cells are missing geometry")
+
+        occupied = 0.0
+        for cid, _cell, metrics in ordered:
+            size = metrics[size_key]
+            if size is None:
+                _die(f"cell {cid} is missing geometry required for mode=gap: {size_key}")
+            occupied += float(size)
+
+        gap = (float(end) - float(start) - occupied) / (len(ordered) - 1)
+        cursor = float(start)
+        target_positions: Dict[str, float] = {}
+        for cid, _cell, metrics in ordered:
+            target_positions[cid] = cursor
+            size = metrics[size_key]
+            assert size is not None
+            cursor += float(size) + gap
+    else:
+        start = ordered[0][2][center_key]
+        end = ordered[-1][2][center_key]
+        if start is None or end is None:
+            _die("cannot compute distribution span; boundary cells are missing center geometry")
+
+        step = (float(end) - float(start)) / (len(ordered) - 1)
+        target_positions = {}
+        for idx, (cid, _cell, metrics) in enumerate(ordered):
+            size = metrics[size_key]
+            if size is None:
+                _die(f"cell {cid} is missing geometry required for mode=center: {size_key}")
+            center = float(start) + (step * idx)
+            target_positions[cid] = center - (float(size) / 2.0)
+
+    for cid, cell, _metrics in ordered[1:-1]:
+        geom = _geometry_element(cell)
+        assert geom is not None
+        new_value = target_positions[cid]
+        new_raw = _format_coordinate(new_value)
+        old_raw = geom.get(attr)
+        old_num = None if old_raw is None else float(old_raw)
+        if old_num is None or abs(old_num - new_value) > 1e-9:
+            if _apply_geometry_edit(cell, [(attr, new_raw)]):
+                modified += 1
+                changes.append(f"{cid}: {attr} {old_raw if old_raw is not None else '<unset>'} -> {new_raw}")
+
+    _save_page_models(diagrams, page_models, args.storage)
+
+    if args.dry_run:
+        print(
+            f"dry-run: distributed {len(target_ids)} cell(s) on axis={args.axis} mode={args.mode}; "
+            f"would modify {modified} interior cell(s)"
+        )
+        for change in changes[:20]:
+            print(f"- {change}")
+        return 0
+
+    backup_path = _write_with_optional_backup(tree, args.output, args.backup)
+    msg = (
+        f"distributed {len(target_ids)} cell(s) on axis={args.axis} mode={args.mode}; "
+        f"modified {modified} interior cell(s), wrote {len(diagrams)} page(s) to {args.output}"
+    )
+    if backup_path:
+        msg += f"; backup={backup_path}"
+    print(msg)
     return 0
 
 
@@ -711,8 +1164,9 @@ def cmd_set_cell(args: argparse.Namespace) -> int:
     diagrams = _get_diagrams(root)
 
     set_pairs = _parse_key_value_pairs(args.set_style, "--set-style")
+    set_geom_pairs = _parse_geometry_pairs(args.set_geom, "--set-geom")
     remove_keys = args.remove_style or []
-    _ensure_change_request(args.set_value, args.append_value, set_pairs, remove_keys)
+    _ensure_change_request(args.set_value, args.append_value, set_pairs, remove_keys, set_geom_pairs)
 
     page_models = _load_page_models(diagrams)
 
@@ -725,7 +1179,7 @@ def cmd_set_cell(args: argparse.Namespace) -> int:
             if cell.get("id") != args.cell_id:
                 continue
             matched += 1
-            if _apply_cell_edit(cell, args.set_value, args.append_value, set_pairs, remove_keys):
+            if _apply_cell_edit(cell, args.set_value, args.append_value, set_pairs, remove_keys, set_geom_pairs):
                 modified += 1
 
     if matched == 0:
@@ -766,8 +1220,9 @@ def cmd_set_cells(args: argparse.Namespace) -> int:
             target_ids.append(cid)
 
     set_pairs = _parse_key_value_pairs(args.set_style, "--set-style")
+    set_geom_pairs = _parse_geometry_pairs(args.set_geom, "--set-geom")
     remove_keys = args.remove_style or []
-    _ensure_change_request(args.set_value, args.append_value, set_pairs, remove_keys)
+    _ensure_change_request(args.set_value, args.append_value, set_pairs, remove_keys, set_geom_pairs)
 
     page_models = _load_page_models(diagrams)
 
@@ -784,7 +1239,7 @@ def cmd_set_cells(args: argparse.Namespace) -> int:
             matched += 1
             if cid is not None:
                 matched_ids.add(cid)
-            if _apply_cell_edit(cell, args.set_value, args.append_value, set_pairs, remove_keys):
+            if _apply_cell_edit(cell, args.set_value, args.append_value, set_pairs, remove_keys, set_geom_pairs):
                 modified += 1
 
     missing_ids = [cid for cid in target_ids if cid not in matched_ids]
@@ -1182,6 +1637,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--json", action="store_true", help="Output JSON")
     p_list.set_defaults(func=cmd_list_cells)
 
+    p_measure = sub.add_parser("measure", help="Show geometry metrics for selected cell ids")
+    p_measure.add_argument("input", help="Input .drawio/.xml file")
+    p_measure.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_measure.add_argument(
+        "--cell-id",
+        action="append",
+        required=True,
+        help="mxCell id to measure (repeatable)",
+    )
+    p_measure.add_argument("--json", action="store_true", help="Output JSON")
+    p_measure.set_defaults(func=cmd_measure)
+
     p_validate = sub.add_parser("validate", help="Validate page decodability, references, and style/theme risks")
     p_validate.add_argument("input", help="Input .drawio/.xml file")
     p_validate.add_argument(
@@ -1260,6 +1727,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Style key to remove (repeatable)",
     )
     p_set.add_argument(
+        "--set-geom",
+        action="append",
+        help="Geometry key=value to set for x, y, width, or height (repeatable)",
+    )
+    p_set.add_argument(
         "--storage",
         choices=["preserve", "compressed", "uncompressed"],
         default="preserve",
@@ -1310,12 +1782,127 @@ def build_parser() -> argparse.ArgumentParser:
         help="Style key to remove (repeatable)",
     )
     p_set_multi.add_argument(
+        "--set-geom",
+        action="append",
+        help="Geometry key=value to set for x, y, width, or height (repeatable)",
+    )
+    p_set_multi.add_argument(
         "--storage",
         choices=["preserve", "compressed", "uncompressed"],
         default="preserve",
         help="Output page storage mode",
     )
     p_set_multi.set_defaults(func=cmd_set_cells)
+
+    p_align = sub.add_parser("align", help="Align absolute-position cells to a reference cell or parent")
+    p_align.add_argument("input", help="Input .drawio/.xml file")
+    p_align.add_argument("output", help="Output file")
+    p_align.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Allow writing to the same path as input",
+    )
+    p_align.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output file",
+    )
+    p_align.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a timestamped backup of the output path before writing",
+    )
+    p_align.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and report changes without writing output",
+    )
+    p_align.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_align.add_argument(
+        "--cell-id",
+        action="append",
+        required=True,
+        help="mxCell id to align (repeatable)",
+    )
+    p_align.add_argument(
+        "--axis",
+        choices=["left", "center-x", "right", "top", "center-y", "bottom"],
+        required=True,
+        help="Axis or edge to align",
+    )
+    target_group = p_align.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--to-cell", help="Reference cell id")
+    target_group.add_argument(
+        "--to-parent",
+        action="store_true",
+        help="Use each selected cell's parent as its alignment reference",
+    )
+    p_align.add_argument(
+        "--offset",
+        type=float,
+        default=0.0,
+        help="Optional offset to apply after alignment along the affected axis",
+    )
+    p_align.add_argument(
+        "--storage",
+        choices=["preserve", "compressed", "uncompressed"],
+        default="preserve",
+        help="Output page storage mode",
+    )
+    p_align.set_defaults(func=cmd_align)
+
+    p_distribute = sub.add_parser(
+        "distribute",
+        help="Distribute absolute-position cells evenly between the outermost cells",
+    )
+    p_distribute.add_argument("input", help="Input .drawio/.xml file")
+    p_distribute.add_argument("output", help="Output file")
+    p_distribute.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Allow writing to the same path as input",
+    )
+    p_distribute.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output file",
+    )
+    p_distribute.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a timestamped backup of the output path before writing",
+    )
+    p_distribute.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and report changes without writing output",
+    )
+    p_distribute.add_argument("--page", type=int, help="Optional 1-based page index filter")
+    p_distribute.add_argument(
+        "--cell-id",
+        action="append",
+        required=True,
+        help="mxCell id to distribute (repeatable)",
+    )
+    p_distribute.add_argument(
+        "--axis",
+        choices=["horizontal", "vertical"],
+        required=True,
+        help="Axis to distribute along",
+    )
+    p_distribute.add_argument(
+        "--mode",
+        choices=["gap", "center"],
+        default="gap",
+        help="Distribution strategy: equal gaps or equal center spacing",
+    )
+    p_distribute.add_argument(
+        "--storage",
+        choices=["preserve", "compressed", "uncompressed"],
+        default="preserve",
+        help="Output page storage mode",
+    )
+    p_distribute.set_defaults(func=cmd_distribute)
 
     p_theme = sub.add_parser("apply-theme", help="Apply a light/dark neutral style transform")
     p_theme.add_argument("input", help="Input .drawio/.xml file")
