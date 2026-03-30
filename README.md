@@ -7,18 +7,19 @@ Use the [Vercel Skills CLI](https://github.com/vercel/skills) to install and man
 ## Install
 
 ```bash
-# Install a specific skill for a specific agent
-npx skills add mrecek/skills --skill yt-transcript -g -a <agent>
+# Install a specific skill globally for a specific agent
+npx skills add mrecek/skills --skill <skill-name> -g -a <agent>
 
 # Examples
+npx skills add mrecek/skills -s greenfield -g -a claude-code
 npx skills add mrecek/skills -s yt-transcript -g -a claude-code
-npx skills add mrecek/skills -s yt-transcript -g -a cursor
+npx skills add mrecek/skills -s drawio-diagrams -g -a cursor
 ```
 
 ## Available Skills
 
-This repo currently ships a single skill.
-
-| Skill | Description |
-|-------|-------------|
-| `yt-transcript` | Format YouTube transcripts using yt-dlp with author chapters as section markers |
+| Skill | Type | Description |
+|-------|------|-------------|
+| `greenfield` | Behavioral | First-principles design mode for building or rewriting documentation, skills, and code |
+| `drawio-diagrams` | Tool | Read, validate, and edit draw.io diagrams at the XML level |
+| `yt-transcript` | Tool | Format YouTube transcripts into markdown using yt-dlp with author chapters |
