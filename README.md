@@ -23,3 +23,4 @@ npx skills add mrecek/skills -s drawio-diagrams -g -a cursor
 | `greenfield` | Behavioral | First-principles design mode for building or rewriting documentation, skills, and code |
 | `drawio-diagrams` | Tool | Read, validate, and edit draw.io diagrams at the XML level |
 | `yt-transcript` | Tool | Format YouTube transcripts into markdown using yt-dlp with author chapters |
+| `handoff` | Behavioral | Preserve session context into structured handoff documents for seamless session transitions |
