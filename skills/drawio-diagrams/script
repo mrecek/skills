@@ -1267,6 +1267,20 @@ def cmd_set_cells(args: argparse.Namespace) -> int:
     return 0
 
 
+def _label_on_shape(style_map: Dict[str, str]) -> bool:
+    """True only when the label renders on top of the shape's fill.
+
+    draw.io places labels in the shape center by default, but
+    verticalLabelPosition=top|bottom or labelPosition=left|right offsets the
+    label off the shape (common for image/icon cells with captions beneath).
+    In those cases the label sits on the page background, not the fill, so a
+    fill-vs-font contrast check would be a false positive.
+    """
+    vlp = (style_map.get("verticalLabelPosition") or "middle").strip().lower()
+    lp = (style_map.get("labelPosition") or "center").strip().lower()
+    return vlp == "middle" and lp == "center"
+
+
 def _style_lint_findings(page_idx: int, cell: ET.Element) -> List[str]:
     findings: List[str] = []
     cid = cell.get("id") or "<missing-id>"
@@ -1295,7 +1309,8 @@ def _style_lint_findings(page_idx: int, cell: ET.Element) -> List[str]:
 
     font_raw = style_map.get("fontColor")
     fill_raw = style_map.get("fillColor")
-    if fill_raw:
+    has_label = bool(value.strip())
+    if fill_raw and has_label and _label_on_shape(style_map):
         fill_l = fill_raw.strip().lower()
         if fill_l not in {"none", "transparent", "default"}:
             fill_rgb = _parse_hex_color(fill_l)
