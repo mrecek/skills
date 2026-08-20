@@ -24,3 +24,4 @@ npx skills add mrecek/skills -s drawio-diagrams -g -a cursor
 | `drawio-diagrams` | Tool | Read, validate, and edit draw.io diagrams at the XML level |
 | `yt-transcript` | Tool | Format YouTube transcripts into markdown using yt-dlp with author chapters |
 | `handoff` | Behavioral | Preserve session context into structured handoff documents for seamless session transitions |
+| `architect-brief` | Behavioral | Shape decision summaries for a systems-architect reader — plain infrastructure nouns, detail first, conclusion last |
