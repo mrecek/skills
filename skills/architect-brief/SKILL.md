@@ -6,9 +6,11 @@ description: "Architect-altitude decision briefs. Use when the user asks for a h
 # Architect Brief
 
 Reader calibration and the noun rules live in the user's `~/.claude/CLAUDE.md`.
-This skill adds the brief *shape* on top of them. Keep the architecture at full
-strength. **Altitude** is about which nouns you use, not how hard the ideas are
-allowed to be.
+This skill adds the brief *shape* on top of them, including one deliberate
+override: elsewhere the conclusion opens the response, but inside this skill
+the brief closes it instead — see Firing without being asked. Keep the
+architecture at full strength. **Altitude** is about which nouns you use, not
+how hard the ideas are allowed to be.
 
 ## Altitude
 
@@ -81,14 +83,24 @@ the decision back.
 
 ## Firing without being asked
 
-When a turn hands the user a decision and they did not ask for a brief, open
-with the full evidence-backed detail under its own heading, then close with
-the brief below it. Nothing is suppressed. The altitude comes last on purpose:
-a long response lands with its tail on screen and its head scrolled out of
-view, so the brief has to be the last thing written to land in view first.
+When a turn hands the user a decision and they did not ask for a brief, the
+detail goes first and the brief closes the turn. A long response lands in a
+scrolling terminal with its tail on screen and its head already scrolled out
+of view, so the brief — the part that has to register on arrival — has to be
+the last thing written.
 
-Ground level belongs at the top now. File paths, line numbers, symbol names,
-and evidence trails all live in the detail section, ahead of the brief.
+Open with the full evidence-backed detail under its own heading, `## Detail`
+unless something more specific fits. File paths, line numbers, symbol names,
+and evidence trails all live there, at ground level. Nothing is suppressed,
+only reordered.
+
+Close with the brief, unlabeled. Its bolded lead-ins already read as an
+arrival rather than a continuation of the detail above — see Shape above for
+that block on its own.
+
+This order is about the user's own terminal, not about briefs in general. A
+brief going to someone else follows Forward below instead, and stays
+conclusion-first.
 
 When the user asks for the full review, audit, or analysis, give that alone.
 
@@ -107,12 +119,15 @@ here.
 ## Forward
 
 When the brief is going to someone else, such as teammates, technical managers,
-a change advisory board, or operators, two things change:
+a change advisory board, or operators, three things change:
 
 - Lead with what changes for that audience and what they have to do, in place of
   the user's decision.
 - Drop internal repo, plan, and branch names. They resolve for nobody outside
   the work.
+- Keep the conclusion first. The detail-then-brief order above exists because
+  of how a long response sits in the user's own terminal; a forwarded reader
+  isn't scrolling that window, so lead with the call instead of closing on it.
 
 Ask who the audience is when it isn't stated.
 
