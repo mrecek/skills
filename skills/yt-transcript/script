@@ -238,12 +238,12 @@ def validate_youtube_url(url):
 
 def pip_install_hint(package_spec='yt-dlp'):
     """Return interpreter-specific install guidance."""
-    current_python = f'"{sys.executable}" -m pip install "{package_spec}"'
+    current_python = f'"{sys.executable}" -m pip install --upgrade "{package_spec}"'
     if os.name == 'nt':
         return [
             f'  {current_python}',
             '  # or',
-            f'  py -m pip install "{package_spec}"',
+            f'  py -m pip install --upgrade "{package_spec}"',
         ]
     return [f'  {current_python}']
 
