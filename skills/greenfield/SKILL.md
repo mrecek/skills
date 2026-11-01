@@ -1,6 +1,7 @@
 ---
 name: greenfield
-description: "Greenfield development mode — activates first-principles design thinking for building or rewriting documentation, skills, and code. Treats everything as new construction: no backwards compatibility, no historical references, no incremental patching. Invoked explicitly via `/greenfield`."
+description: "First-principles design mode for building or rewriting documentation, skills, and code as new construction, with no backwards compatibility. Runs only when invoked as /greenfield."
+disable-model-invocation: true
 ---
 
 # Greenfield Mode

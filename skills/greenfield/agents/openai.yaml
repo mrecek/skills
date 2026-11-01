@@ -1,0 +1,5 @@
+interface:
+  display_name: "Greenfield"
+  short_description: "First-principles design mode, built as new construction"
+policy:
+  allow_implicit_invocation: false

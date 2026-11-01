@@ -40,6 +40,15 @@ The `npx skills` CLI parses frontmatter with [gray-matter](https://github.com/jo
 
 When in doubt, quote it. Unquoted descriptions with colons are the most common cause of skills not appearing in `npx skills install`.
 
+### Slash-Command-Only Skills
+
+A skill meant to run only when the user types its name needs two settings, one per harness:
+
+- `disable-model-invocation: true` in the `SKILL.md` frontmatter, for Claude Code.
+- `agents/openai.yaml` with `policy.allow_implicit_invocation: false`, for Codex.
+
+With both set, the description is a one-line summary for the person browsing skills, ending "Runs only when invoked as /<name>." for harnesses that read neither setting. `handoff` and `greenfield` follow this pattern.
+
 ## How Discovery Works
 
 The CLI clones the repo and scans these paths in order:
