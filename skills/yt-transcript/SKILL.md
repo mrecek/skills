@@ -33,11 +33,11 @@ Python 3.10+ is required.
 
 - macOS/Linux:
 ```bash
-python -m pip install "yt-dlp[default]"
+python -m pip install --upgrade "yt-dlp[default]"
 ```
 - Windows:
 ```bash
-py -m pip install "yt-dlp[default]"
+py -m pip install --upgrade "yt-dlp[default]"
 ```
 
 Optional fallback dependencies:
@@ -53,7 +53,7 @@ python -m pip install youtube-transcript-api openai-whisper
 If your default `python` is older, create a venv with Python 3.10+ first:
 ```bash
 /opt/homebrew/bin/python3.13 -m venv .venv
-.venv/bin/python -m pip install "yt-dlp[default]" youtube-transcript-api
+.venv/bin/python -m pip install --upgrade "yt-dlp[default]" youtube-transcript-api
 ```
 
 ## Workflow
@@ -146,6 +146,7 @@ The generated markdown artifact should follow this shape:
 ## Error Handling Guidance
 
 Common failures and responses:
+- any extraction failure (`DownloadError`, HTTP 403, "Sign in to confirm you're not a bot", signature or format errors) -> upgrade `yt-dlp` in the script's interpreter first (`--upgrade "yt-dlp[default]"`), then rerun; YouTube changes routinely break older releases
 - `yt-dlp` missing in active interpreter -> provide interpreter-specific install command
 - JS runtime / `yt-dlp-ejs` messages -> recommend `yt-dlp[default]` + runtime install
 - missing preferred language subtitles -> ensure `youtube-transcript-api` is installed, then rerun
