@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script --upgrade-package yt-dlp
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "yt-dlp[default]",
+#     "youtube-transcript-api",
+# ]
+# ///
 """
 YouTube transcript formatter.
 
@@ -236,16 +243,11 @@ def validate_youtube_url(url):
     return False
 
 
-def pip_install_hint(package_spec='yt-dlp'):
-    """Return interpreter-specific install guidance."""
-    current_python = f'"{sys.executable}" -m pip install --upgrade "{package_spec}"'
-    if os.name == 'nt':
-        return [
-            f'  {current_python}',
-            '  # or',
-            f'  py -m pip install --upgrade "{package_spec}"',
-        ]
-    return [f'  {current_python}']
+def uv_run_hint(extra_package=None):
+    """Return the uv command that runs this script with current dependencies."""
+    with_extra = f' --with {extra_package}' if extra_package else ''
+    script_path = os.path.abspath(__file__)
+    return [f'  uv run --script --upgrade-package yt-dlp{with_extra} "{script_path}" <url> <output>']
 
 
 def check_python_version():
@@ -260,10 +262,9 @@ def check_python_version():
         file=sys.stderr
     )
     print('', file=sys.stderr)
-    print('Use a Python 3.10+ interpreter or create a venv with one, then install dependencies there.', file=sys.stderr)
-    print('Example:', file=sys.stderr)
-    print('  /opt/homebrew/bin/python3.13 -m venv .venv', file=sys.stderr)
-    print('  .venv/bin/python -m pip install "yt-dlp[default]" youtube-transcript-api', file=sys.stderr)
+    print('Run the script through uv, which supplies a suitable Python and the dependencies:', file=sys.stderr)
+    for hint in uv_run_hint():
+        print(hint, file=sys.stderr)
     sys.exit(1)
 
 
@@ -276,8 +277,8 @@ def check_yt_dlp():
     if YTDLP_IMPORT_ERROR is not None:
         print(f"Details: {YTDLP_IMPORT_ERROR}", file=sys.stderr)
     print('', file=sys.stderr)
-    print('Install yt-dlp into the same interpreter used to run this script:', file=sys.stderr)
-    for hint in pip_install_hint():
+    print('Run the script through uv, which installs the latest yt-dlp for it:', file=sys.stderr)
+    for hint in uv_run_hint():
         print(hint, file=sys.stderr)
     print('', file=sys.stderr)
     print('For more info: https://github.com/yt-dlp/yt-dlp', file=sys.stderr)
@@ -735,9 +736,9 @@ def js_runtime_guidance(download_error_message):
 
     lines = [
         'YouTube extraction currently requires a JavaScript runtime for yt-dlp.',
-        'Install/update yt-dlp extras and runtime in this environment:',
+        'Run through uv so yt-dlp and its yt-dlp-ejs extra are current:',
     ]
-    for hint in pip_install_hint(package_spec='yt-dlp[default]'):
+    for hint in uv_run_hint():
         lines.append(hint)
     lines.append('Then ensure a JS runtime is available (recommended: Deno).')
     return '\n'.join(lines)
@@ -876,9 +877,9 @@ def run_asr_fallback(url, temp_dir, preferred_language, model_name, network_sett
     except ModuleNotFoundError as error:
         message_lines = [
             'ASR fallback requested, but openai-whisper is not installed in this environment.',
-            'Install dependencies:',
+            'Rerun with openai-whisper added to the uv command:',
         ]
-        for hint in pip_install_hint(package_spec='openai-whisper'):
+        for hint in uv_run_hint(extra_package='openai-whisper'):
             message_lines.append(hint)
         message_lines.append('Also ensure ffmpeg is installed and available on PATH.')
         raise RuntimeError('\n'.join(message_lines)) from error
@@ -930,9 +931,9 @@ def run_youtube_transcript_api_fallback(video_id, preferred_language, proxy_sett
     except ModuleNotFoundError as error:
         message_lines = [
             'youtube-transcript-api fallback is unavailable because the package is not installed.',
-            'Install dependency:',
+            'Run the script through uv, which installs it:',
         ]
-        for hint in pip_install_hint(package_spec='youtube-transcript-api'):
+        for hint in uv_run_hint():
             message_lines.append(hint)
         raise RuntimeError('\n'.join(message_lines)) from error
 
