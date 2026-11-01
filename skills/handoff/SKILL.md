@@ -1,6 +1,7 @@
 ---
 name: handoff
-description: "Preserve context and create comprehensive handoff documents for seamless session transitions. This skill is invoked only via the /handoff slash command — do not trigger it automatically."
+description: "Write a handoff document that preserves this session's context for the next session. Runs only when invoked as /handoff."
+disable-model-invocation: true
 ---
 
 # Handoff
