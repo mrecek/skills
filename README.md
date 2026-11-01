@@ -2,7 +2,7 @@
 
 Custom AI agent skills designed to work with agent harnesses that support skills, such as Claude Code, Cursor, and OpenCode.
 
-Use the [Vercel Skills CLI](https://github.com/vercel/skills) to install and manage skills.
+Use the [Vercel Skills CLI](https://github.com/vercel-labs/skills) to install and manage skills.
 
 ## Install
 
