@@ -28,33 +28,11 @@ The script also auto-generates canonical filenames when given a directory target
 
 ## Runtime Requirements
 
-Install dependencies into the same Python interpreter used to run the script.
-Python 3.10+ is required.
+Requires [`uv`](https://docs.astral.sh/uv/). The script declares its own Python dependencies (`yt-dlp[default]`, `youtube-transcript-api`) in its header, so there is no install step: `uv` builds a private environment on the first run.
 
-- macOS/Linux:
-```bash
-python -m pip install --upgrade "yt-dlp[default]"
-```
-- Windows:
-```bash
-py -m pip install --upgrade "yt-dlp[default]"
-```
+Always run it with `--upgrade-package yt-dlp`, which moves yt-dlp to its latest release on every run (about half a second). YouTube changes routinely break older yt-dlp releases, so the latest release is the only safe one.
 
-Optional fallback dependencies:
-- `youtube-transcript-api`
-- `openai-whisper`
-- `ffmpeg`
-
-Example install:
-```bash
-python -m pip install youtube-transcript-api openai-whisper
-```
-
-If your default `python` is older, create a venv with Python 3.10+ first:
-```bash
-/opt/homebrew/bin/python3.13 -m venv .venv
-.venv/bin/python -m pip install --upgrade "yt-dlp[default]" youtube-transcript-api
-```
+The Whisper ASR fallback (`--asr-fallback`) also needs `--with openai-whisper` on the `uv` command and `ffmpeg` on `PATH`.
 
 ## Workflow
 
@@ -102,19 +80,14 @@ Wait for user confirmation.
 
 Use absolute paths and quote arguments.
 
-Linux/macOS example:
+Run the script by its full path in this skill's folder, in double quotes, on every platform:
 ```bash
-python "/full/path/to/yt-transcript/script" "https://www.youtube.com/watch?v=VIDEO_ID" "/full/path/to/youtube-transcripts"
+uv run --script --upgrade-package yt-dlp "<skill folder>/script" "https://www.youtube.com/watch?v=VIDEO_ID" "/full/path/to/youtube-transcripts"
 ```
 
-Windows example:
+With fallbacks (ASR adds `--with openai-whisper`):
 ```bash
-py "C:\path\to\yt-transcript\script" "https://www.youtube.com/watch?v=VIDEO_ID" "C:\path\to\youtube-transcripts"
-```
-
-With fallbacks:
-```bash
-python "/full/path/to/yt-transcript/script" "URL" "/full/path/to/youtube-transcripts" --cookies-from-browser "chrome" --proxy "socks5://127.0.0.1:1080" --asr-fallback
+uv run --script --upgrade-package yt-dlp --with openai-whisper "<skill folder>/script" "URL" "/full/path/to/youtube-transcripts" --cookies-from-browser "chrome" --proxy "socks5://127.0.0.1:1080" --asr-fallback
 ```
 
 ### Step 6: Report Outcome
@@ -146,11 +119,10 @@ The generated markdown artifact should follow this shape:
 ## Error Handling Guidance
 
 Common failures and responses:
-- any extraction failure (`DownloadError`, HTTP 403, "Sign in to confirm you're not a bot", signature or format errors) -> upgrade `yt-dlp` in the script's interpreter first (`--upgrade "yt-dlp[default]"`), then rerun; YouTube changes routinely break older releases
-- `yt-dlp` missing in active interpreter -> provide interpreter-specific install command
-- JS runtime / `yt-dlp-ejs` messages -> recommend `yt-dlp[default]` + runtime install
-- missing preferred language subtitles -> ensure `youtube-transcript-api` is installed, then rerun
-- no subtitles from provider fallbacks -> rerun with `--asr-fallback`
+- `yt-dlp` missing, or a Python version error -> the script was run with plain `python`; rerun it with the `uv run` command above
+- any extraction failure (`DownloadError`, HTTP 403, "Sign in to confirm you're not a bot", signature or format errors) -> the run already used the latest yt-dlp; rerun once in case a fix shipped since, then try cookies, a proxy, or `--yt-impersonate`
+- JS runtime / `yt-dlp-ejs` messages -> install a JavaScript runtime (recommended: Deno), then rerun
+- no subtitles from provider fallbacks -> rerun with `--asr-fallback` and `--with openai-whisper`
 - blocked/rate-limited requests -> rerun with proxy flags (`--proxy`, `--http-proxy`, `--https-proxy`)
 - gated/auth-required access -> rerun with `--cookies` or `--cookies-from-browser`
 - invalid URL -> ask user to verify URL format
